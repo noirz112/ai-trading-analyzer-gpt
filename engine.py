@@ -310,12 +310,18 @@ def analyze(df: pd.DataFrame) -> dict:
     cvd_trend = cvd_now - cvd_prev
     price_change_lb = c.iloc[-1] - c.iloc[-1 - lookback]
 
-    if delta_now > 0:
+    # PATCH: delta == 0 (candle bervolume 0 / taker buy = sell) dulu jatuh ke
+    # cabang else dan dihitung sebagai tekanan JUAL (-10) -> bias bearish palsu,
+    # terutama di M1/M5 saat likuiditas proxy tipis. Sekarang dibuat netral.
+    DELTA_EPS = 1e-9
+    if delta_now > DELTA_EPS:
         score += 10
         reasons.append(f"Delta candle terakhir {delta_now:+.2f} -> tekanan beli agresif (taker buy dominan)")
-    else:
+    elif delta_now < -DELTA_EPS:
         score -= 10
         reasons.append(f"Delta candle terakhir {delta_now:+.2f} -> tekanan jual agresif (taker sell dominan)")
+    else:
+        reasons.append(f"Delta candle terakhir {delta_now:+.2f} -> netral (volume 0 / taker buy = sell), tidak menambah skor")
 
     if cvd_trend > 0 and price_change_lb > 0:
         score += 10
