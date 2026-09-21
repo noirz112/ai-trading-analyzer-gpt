@@ -54,7 +54,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines"
 
 # Alias: nama akrab -> simbol Binance yang tersedia tanpa API key.
 # PAXGUSDT = PAX Gold (token 1:1 emas fisik), melacak spot XAUUSD.
@@ -162,6 +162,7 @@ def fetch_klines(symbol: str, interval: str = "4h", limit: int = 300) -> pd.Data
     for c in ["open", "high", "low", "close", "volume", "tbb"]:
         df[c] = df[c].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df = df.iloc[:-1].reset_index(drop=True)  # buang candle berjalan (belum close)
     return df
 
 
@@ -174,9 +175,13 @@ def ema(s: pd.Series, p: int) -> pd.Series:
 
 def rsi(s: pd.Series, p: int = 14) -> pd.Series:
     d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean()
-    rs = g / l
+    g = d.clip(lower=0)
+    l = -d.clip(upper=0)
+    # Wilder's smoothing (bukan SMA biasa) -> standar RSI yang dipakai TradingView/MT4/MT5.
+    # alpha = 1/p ekuivalen dengan metode averaging asli Wilder.
+    avg_gain = g.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    avg_loss = l.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
@@ -390,8 +395,9 @@ def build_setup(a: dict, rr: float = 2.0, atr_mult: float = 1.5) -> dict:
     else:
         direction = "NEUTRAL"
 
-    # confidence: petakan |score| ke 50..90
-    conf = min(90.0, 50.0 + abs(a["score"]))
+    # confidence: petakan |score| ke 50..90 secara proporsional (skor maks teoretis ~145)
+    SCORE_MAX = 145.0
+    conf = 50.0 + 40.0 * min(1.0, abs(a["score"]) / SCORE_MAX)
 
     if direction == "LONG":
         # LIMIT BUY: entry sedikit di bawah harga sekarang (pullback), bukan market.
