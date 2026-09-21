@@ -16,9 +16,13 @@ Tool ini bekerja sebagai ANALIS — bukan eksekutor. Outputnya:
 >>> SEMUA EKSEKUSI TETAP DILAKUKAN MANUAL OLEH USER. <<<
 
 Sumber data  : Binance public API (TANPA API key).
-Indikator    : EMA50/200, RSI(14), MACD, Bollinger Bands, ATR(14).
-Skoring      : Multi-faktor (-100 ... +100). Model kuantitatif berbasis aturan
-               (rule-based expert system). Bisa di-extend ke LLM (lihat bawah).
+Indikator    : EMA50/200, RSI(14), MACD, Bollinger Bands, ATR(14),
+               Ichimoku (Tenkan/Kijun/Kumo), Order Flow Delta + CVD
+               (dari kolom taker-buy-volume di klines, tanpa endpoint tambahan).
+Skoring      : Multi-faktor (rule-based expert system, 7 faktor). Bisa di-extend
+               ke LLM (lihat bawah).
+Order type   : Entry disajikan sebagai LIMIT ORDER (bukan market), diposisikan
+               sedikit pullback dari harga saat ini agar entry lebih baik.
 
 DUKUNGAN ASSET:
   - Crypto  : BTCUSDT, ETHUSDT, SOLUSDT, dll. (langsung dari Binance)
@@ -152,8 +156,10 @@ def fetch_klines(symbol: str, interval: str = "4h", limit: int = 300) -> pd.Data
     cols = ["open_time", "open", "high", "low", "close", "volume",
             "close_time", "qav", "trades", "tbb", "tbq", "ignore"]
     df = pd.DataFrame(r.json(), columns=cols)
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-    for c in ["open", "high", "low", "close", "volume"]:
+    # "tbb" (taker buy base asset volume) ikut disimpan -> dasar perhitungan
+    # Order Flow Delta / CVD di bawah, tanpa perlu endpoint/API call tambahan.
+    df = df[["open_time", "open", "high", "low", "close", "volume", "tbb"]].copy()
+    for c in ["open", "high", "low", "close", "volume", "tbb"]:
         df[c] = df[c].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df
@@ -193,6 +199,33 @@ def atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
     return tr.rolling(p).mean()
 
 
+def ichimoku(df: pd.DataFrame, tenkan_p: int = 9, kijun_p: int = 26,
+             senkou_b_p: int = 52, displacement: int = 26):
+    """Ichimoku Kinko Hyo standar. Kumo (senkou A/B) di-shift maju (displacement)
+    sesuai definisi asli -> dipakai versi 'as of now' (tanpa shift) untuk cloud
+    yang relevan terhadap harga saat ini (common practical adaptation)."""
+    high, low = df["high"], df["low"]
+    tenkan = (high.rolling(tenkan_p).max() + low.rolling(tenkan_p).min()) / 2
+    kijun = (high.rolling(kijun_p).max() + low.rolling(kijun_p).min()) / 2
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (high.rolling(senkou_b_p).max() + low.rolling(senkou_b_p).min()) / 2
+    return tenkan, kijun, senkou_a, senkou_b
+
+
+def orderflow_delta(df: pd.DataFrame) -> pd.Series:
+    """Delta per-candle = taker-buy-volume - taker-sell-volume.
+    Approksimasi tingkat-candle (bukan tick-level footprint), dari kolom
+    'tbb' yang sudah tersedia di klines Binance -> tanpa API call tambahan."""
+    taker_buy = df["tbb"]
+    taker_sell = df["volume"] - df["tbb"]
+    return taker_buy - taker_sell
+
+
+def cvd(delta: pd.Series) -> pd.Series:
+    """Cumulative Volume Delta -> akumulasi delta antar candle."""
+    return delta.cumsum()
+
+
 # =====================================================================
 # 3. SCORING ENGINE (multi-faktor, -100 ... +100)
 # =====================================================================
@@ -203,6 +236,9 @@ def analyze(df: pd.DataFrame) -> dict:
     macd_l, macd_s, hist = macd(c)
     bb_u, bb_m, bb_l = bollinger(c)
     a = atr(df, 14)
+    tenkan, kijun, senkou_a, senkou_b = ichimoku(df)
+    delta = orderflow_delta(df)
+    cvd_s = cvd(delta)
 
     score = 0
     reasons = []
@@ -261,26 +297,95 @@ def analyze(df: pd.DataFrame) -> dict:
     swing_low = df["low"].rolling(20).min().iloc[-1]
     reasons.append(f"Resistance 20-bar: {swing_high:.4f}   |   Support 20-bar: {swing_low:.4f}")
 
+    # --- Faktor 6: Order Flow (Delta + CVD) ---
+    delta_now = delta.iloc[-1]
+    lookback = min(10, len(cvd_s) - 1)
+    cvd_now = cvd_s.iloc[-1]
+    cvd_prev = cvd_s.iloc[-1 - lookback]
+    cvd_trend = cvd_now - cvd_prev
+    price_change_lb = c.iloc[-1] - c.iloc[-1 - lookback]
+
+    if delta_now > 0:
+        score += 10
+        reasons.append(f"Delta candle terakhir {delta_now:+.2f} -> tekanan beli agresif (taker buy dominan)")
+    else:
+        score -= 10
+        reasons.append(f"Delta candle terakhir {delta_now:+.2f} -> tekanan jual agresif (taker sell dominan)")
+
+    if cvd_trend > 0 and price_change_lb > 0:
+        score += 10
+        reasons.append(f"CVD naik & harga naik ({lookback} bar) -> orderflow konfirmasi uptrend")
+    elif cvd_trend < 0 and price_change_lb < 0:
+        score -= 10
+        reasons.append(f"CVD turun & harga turun ({lookback} bar) -> orderflow konfirmasi downtrend")
+    elif cvd_trend < 0 and price_change_lb > 0:
+        score -= 15
+        reasons.append(f"Harga naik tapi CVD turun ({lookback} bar) -> divergence bearish (distribusi tersembunyi)")
+    elif cvd_trend > 0 and price_change_lb < 0:
+        score += 15
+        reasons.append(f"Harga turun tapi CVD naik ({lookback} bar) -> divergence bullish (akumulasi tersembunyi)")
+    else:
+        reasons.append("CVD relatif flat -> tidak ada divergence jelas")
+
+    # --- Faktor 7: Ichimoku ---
+    t_now, k_now = tenkan.iloc[-1], kijun.iloc[-1]
+    sa_now, sb_now = senkou_a.iloc[-1], senkou_b.iloc[-1]
+    if pd.notna(sa_now) and pd.notna(sb_now):
+        cloud_top, cloud_bottom = max(sa_now, sb_now), min(sa_now, sb_now)
+        if c.iloc[-1] > cloud_top:
+            score += 15
+            reasons.append("Harga di atas Kumo (Ichimoku cloud) -> bias bullish")
+        elif c.iloc[-1] < cloud_bottom:
+            score -= 15
+            reasons.append("Harga di bawah Kumo (Ichimoku cloud) -> bias bearish")
+        else:
+            reasons.append("Harga di dalam Kumo -> Ichimoku netral/konsolidasi")
+    else:
+        cloud_top = cloud_bottom = None
+        reasons.append("Kumo Ichimoku belum cukup data (butuh >=52 bar)")
+
+    if pd.notna(t_now) and pd.notna(k_now):
+        if t_now > k_now:
+            score += 10
+            reasons.append("Tenkan-sen > Kijun-sen -> momentum bullish Ichimoku")
+        else:
+            score -= 10
+            reasons.append("Tenkan-sen < Kijun-sen -> momentum bearish Ichimoku")
+
     return dict(
         score=score, reasons=reasons,
         price=float(c.iloc[-1]), atr=float(a.iloc[-1]),
         rsi=float(r_now), ema50=float(e50.iloc[-1]), ema200=float(e200.iloc[-1]),
         bb_u=float(bb_u.iloc[-1]), bb_m=float(bb_m.iloc[-1]), bb_l=float(bb_l.iloc[-1]),
         swing_high=float(swing_high), swing_low=float(swing_low),
+        delta=float(delta_now), cvd=float(cvd_now), cvd_trend=float(cvd_trend),
+        tenkan=float(t_now) if pd.notna(t_now) else None,
+        kijun=float(k_now) if pd.notna(k_now) else None,
+        cloud_top=float(cloud_top) if cloud_top is not None else None,
+        cloud_bottom=float(cloud_bottom) if cloud_bottom is not None else None,
     )
 
 
 # =====================================================================
 # 4. SETUP BUILDER (Entry / SL / TP berbasis ATR)
 # =====================================================================
+NEUTRAL_THRESHOLD = 30  # dinaikkan dari 20 -> skor maks sekarang lebih besar
+                        # (7 faktor, bukan 5), threshold disesuaikan proporsional
+                        # agar zona NEUTRAL tetap relevan (~sama % dari skor maks).
+LIMIT_OFFSET_MULT = 0.3  # jarak entry limit dari harga saat ini (x ATR),
+                          # menempatkan entry di pullback yang lebih baik
+                          # daripada langsung entry di harga pasar sekarang.
+
+
 def build_setup(a: dict, rr: float = 2.0, atr_mult: float = 1.5) -> dict:
     price = a["price"]
     atrv = a["atr"]
     sl_dist = atr_mult * atrv  # jarak SL dari entry, proporsional volatilitas
+    limit_offset = LIMIT_OFFSET_MULT * atrv
 
-    if a["score"] > 20:
+    if a["score"] > NEUTRAL_THRESHOLD:
         direction = "LONG"
-    elif a["score"] < -20:
+    elif a["score"] < -NEUTRAL_THRESHOLD:
         direction = "SHORT"
     else:
         direction = "NEUTRAL"
@@ -289,27 +394,33 @@ def build_setup(a: dict, rr: float = 2.0, atr_mult: float = 1.5) -> dict:
     conf = min(90.0, 50.0 + abs(a["score"]))
 
     if direction == "LONG":
-        entry = price
+        # LIMIT BUY: entry sedikit di bawah harga sekarang (pullback), bukan market.
+        entry = price - limit_offset
         sl = entry - sl_dist
         tp1 = entry + sl_dist * 1.0
         tp2 = entry + sl_dist * rr
         tp3 = entry + sl_dist * (rr * 1.5)
         risk = entry - sl
+        order_type = "LIMIT"
     elif direction == "SHORT":
-        entry = price
+        # LIMIT SELL: entry sedikit di atas harga sekarang (pullback), bukan market.
+        entry = price + limit_offset
         sl = entry + sl_dist
         tp1 = entry - sl_dist * 1.0
         tp2 = entry - sl_dist * rr
         tp3 = entry - sl_dist * (rr * 1.5)
         risk = sl - entry
+        order_type = "LIMIT"
     else:
         entry = price
         sl = tp1 = tp2 = tp3 = price
         risk = 0.0
+        order_type = None
 
     return dict(direction=direction, entry=entry, sl=sl,
                 tp1=tp1, tp2=tp2, tp3=tp3, rr=rr, risk=risk,
-                conf=conf, sl_dist=sl_dist)
+                conf=conf, sl_dist=sl_dist, order_type=order_type,
+                price_now=price, limit_offset=limit_offset)
 
 
 # =====================================================================
@@ -345,7 +456,9 @@ def print_report(symbol, binance_symbol, tf_label, bint, a, s, is_alias=False,
     print(f"  ATR(14)     : {fmt(a['atr'])}   -> jarak SL: {fmt(s['sl_dist'])}")
     print("-" * 64)
     if s["direction"] != "NEUTRAL":
-        print(f"  ENTRY       : {fmt(s['entry'])}")
+        print(f"  ORDER TYPE  : {s['order_type']} (bukan market -> tunggu harga sentuh entry)")
+        print(f"  ENTRY       : {fmt(s['entry'])}    (harga now: {fmt(s['price_now'])}, "
+              f"offset {fmt(s['limit_offset'])})")
         print(f"  STOP LOSS   : {fmt(s['sl'])}    (risk: {fmt(s['risk'])} /candle-unit)")
         print(f"  TP1 (1R)    : {fmt(s['tp1'])}")
         print(f"  TP2 ({s['rr']}R)  : {fmt(s['tp2'])}")
@@ -355,12 +468,18 @@ def print_report(symbol, binance_symbol, tf_label, bint, a, s, is_alias=False,
             rr_actual = abs(s["tp2"] - s["entry"]) / s["risk"]
             print(f"  Risk:Reward : 1 : {rr_actual:.2f}")
     else:
-        print("  Tidak ada setup jelas. Tunggu konfirmasi (skor di rentang -20..+20).")
+        print(f"  Tidak ada setup jelas. Tunggu konfirmasi "
+              f"(skor di rentang -{NEUTRAL_THRESHOLD}..+{NEUTRAL_THRESHOLD}).")
     print("-" * 64)
     print("  KEY LEVELS")
     print(f"   EMA50  : {fmt(a['ema50'])}    EMA200 : {fmt(a['ema200'])}")
     print(f"   BB up  : {fmt(a['bb_u'])}    BB mid: {fmt(a['bb_m'])}    BB low: {fmt(a['bb_l'])}")
     print(f"   Resist : {fmt(a['swing_high'])}    Support: {fmt(a['swing_low'])}")
+    if a.get("cloud_top") is not None:
+        print(f"   Kumo   : {fmt(a['cloud_bottom'])} - {fmt(a['cloud_top'])}"
+              f"    Tenkan: {fmt(a['tenkan'])}    Kijun: {fmt(a['kijun'])}")
+    print(f"   Delta  : {a['delta']:+.2f} (candle terakhir)    "
+          f"CVD trend: {a['cvd_trend']:+.2f} (10 bar)")
     print("-" * 64)
     print("  ALASAN (reasoning):")
     for r_ in a["reasons"]:
