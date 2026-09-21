@@ -24,11 +24,15 @@ Deploy:
 CHANGELOG (perbaikan):
   1. FIX KeyError 'tbb': kolom taker-buy volume (tbb) tidak lagi dibuang.
      Kolom ini dibutuhkan engine.analyze() untuk Order Flow Delta / CVD.
-  2. Semua timeframe (M1, M5, M15, M30, H1, H4, D1) dipetakan langsung di
-     server (TF_MAP), tidak bergantung pada subset yang ada di engine.py.
+  2. Semua timeframe (M1, M5, M15, M30, H1, H4, D1) didukung; parsing memakai
+     engine.parse_timeframe (satu sumber kebenaran, sama dengan CLI).
   3. Kode parsing klines digabung ke satu fungsi (_klines_to_df) supaya
      jalur host utama dan jalur proxy tidak bisa berbeda lagi.
   4. /analyze_multi menerima parameter `timeframes` (mis. "M1,M5,M15").
+  5. Candle yang sedang berjalan dibuang (sama seperti engine.fetch_klines),
+     sehingga hasil server = hasil CLI.
+  6. Field baru `data_quality` + `spot_reference.proxy_spread_abs` untuk
+     memperingatkan data tipis / selisih proxy PAXG vs XAUUSD.
 """
 import os
 import math
@@ -41,45 +45,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 # Reuse engine analisis yang sudah teruji (skor, indikator, setup builder).
-# Catatan: timeframe di-parse oleh server ini sendiri (lihat TF_MAP).
 from engine import (
-    resolve_symbol, analyze, build_setup, fetch_spot,
+    resolve_symbol, parse_timeframe, analyze, build_setup, fetch_spot,
 )
 
 # =====================================================================
-# TIMEFRAME MAP (MT4/MT5 -> interval Binance)
+# TIMEFRAME (single source of truth = engine.TIMEFRAMES)
 # =====================================================================
-TF_MAP = {
-    "M1":  ("1m",  "M1"),
-    "M5":  ("5m",  "M5"),
-    "M15": ("15m", "M15"),
-    "M30": ("30m", "M30"),
-    "H1":  ("1h",  "H1"),
-    "H4":  ("4h",  "H4"),
-    "D1":  ("1d",  "D1"),
-}
-
-# Alias yang ramah user / GPT (semua di-uppercase sebelum dicek).
-# Sengaja TIDAK memetakan "1M" karena di Binance "1M" = 1 bulan, bukan 1 menit.
-TF_ALIASES = {
-    "1": "M1", "5": "M5", "15": "M15", "30": "M30",
-    "60": "H1", "240": "H4", "1440": "D1",
-    "1MIN": "M1", "5MIN": "M5", "15MIN": "M15", "30MIN": "M30",
-    "1H": "H1", "4H": "H4", "1D": "D1", "D": "D1",
-    "60M": "H1", "240M": "H4",
-}
+SUPPORTED_TFS = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
 
 def _parse_tf(timeframe: str):
-    """Kembalikan (interval_binance, label). Raise ValueError bila tidak dikenal."""
-    key = (timeframe or "").strip().upper()
-    key = TF_ALIASES.get(key, key)
-    if key not in TF_MAP:
-        raise ValueError(
-            f"Timeframe '{timeframe}' tidak dikenal. "
-            f"Gunakan salah satu: {', '.join(TF_MAP.keys())}."
-        )
-    return TF_MAP[key]
+    """Kembalikan (interval_binance, label) lewat engine.parse_timeframe.
+    Raise ValueError bila timeframe tidak dikenal."""
+    return parse_timeframe(timeframe or "")
 
 
 # =====================================================================
@@ -116,6 +95,10 @@ def _klines_to_df(raw) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    # Buang candle yang sedang berjalan (belum close) -> konsisten dengan
+    # engine.fetch_klines. Sangat penting di M1/M5: candle setengah jadi
+    # membuat Delta, MACD cross, dan RSI berubah-ubah tiap detik.
+    df = df.iloc[:-1].reset_index(drop=True)
     return df
 
 
@@ -169,8 +152,29 @@ def build_response(symbol: str, timeframe: str, rr: float = 2.0) -> dict:
     spot_price, spot_label = fetch_spot(bsym)
 
     spot_spread_pct = None
+    spot_spread_abs = None
     if spot_price:
-        spot_spread_pct = (a["price"] - spot_price) / spot_price * 100
+        spot_spread_abs = a["price"] - spot_price
+        spot_spread_pct = spot_spread_abs / spot_price * 100
+
+    # --- Data quality: penting untuk timeframe kecil (M1/M5) ---
+    quality_warnings = []
+    last20 = df["volume"].tail(20)
+    zero_vol = int((last20 == 0).sum())
+    if zero_vol > 0:
+        quality_warnings.append(
+            f"{zero_vol} dari 20 candle terakhir bervolume 0 (likuiditas proxy tipis) "
+            "-> Delta/CVD kurang andal."
+        )
+    atr_val = _f(a["atr"])
+    if not atr_val:
+        quality_warnings.append("ATR bernilai 0/tidak valid -> jarak SL tidak bermakna.")
+    if spot_spread_abs is not None and atr_val and abs(spot_spread_abs) > 1.5 * atr_val:
+        quality_warnings.append(
+            f"Selisih proxy vs spot ({spot_spread_abs:+.2f}) lebih besar dari jarak SL "
+            f"(1.5 x ATR = {1.5 * atr_val:.2f}) -> level Entry/SL/TP tidak boleh dipakai "
+            "langsung di broker; geser sesuai selisih."
+        )
 
     risk = _f(s["risk"])
     rr_actual = None
@@ -190,7 +194,14 @@ def build_response(symbol: str, timeframe: str, rr: float = 2.0) -> dict:
         "spot_reference": {
             "price": _f(spot_price),
             "label": spot_label,
+            "proxy_spread_abs": round(spot_spread_abs, 3) if spot_spread_abs is not None else None,
             "proxy_spread_pct": round(spot_spread_pct, 3) if spot_spread_pct is not None else None,
+        },
+        "data_quality": {
+            "bars_used": int(len(df)),
+            "zero_volume_bars_last20": zero_vol,
+            "atr_pct_of_price": round(atr_val / a["price"] * 100, 4) if atr_val and a["price"] else None,
+            "warnings": quality_warnings,
         },
         "setup": {
             "entry": _f(s["entry"]) if s["direction"] != "NEUTRAL" else None,
@@ -250,7 +261,7 @@ def health():
     return {
         "status": "ok",
         "service": "ai-trading-analysis",
-        "timeframes": list(TF_MAP.keys()),
+        "timeframes": SUPPORTED_TFS,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
