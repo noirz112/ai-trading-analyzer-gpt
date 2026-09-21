@@ -12,13 +12,23 @@ dalam bahasa natural kepada user.
 
 ENDPOINTS:
   GET /health            -> status check
-  GET /analyze           -> analisis 1 simbol + 1 timeframe
-  GET /analyze_multi     -> multi-timeframe confluence (M15, H1, H4)
+  GET /analyze           -> analisis 1 simbol + 1 timeframe (M1, M5, M15, M30, H1, H4, D1)
+  GET /analyze_multi     -> multi-timeframe confluence (default M15, H1, H4;
+                            bisa diubah lewat parameter `timeframes`)
 
 Deploy:
   - Render / Railway / Fly.io (gratis, HTTPS otomatis).
   - Set command: uvicorn server:app --host 0.0.0.0 --port $PORT
   - Salin URL https://<app>.onrender.com ke Custom GPT -> Actions.
+
+CHANGELOG (perbaikan):
+  1. FIX KeyError 'tbb': kolom taker-buy volume (tbb) tidak lagi dibuang.
+     Kolom ini dibutuhkan engine.analyze() untuk Order Flow Delta / CVD.
+  2. Semua timeframe (M1, M5, M15, M30, H1, H4, D1) dipetakan langsung di
+     server (TF_MAP), tidak bergantung pada subset yang ada di engine.py.
+  3. Kode parsing klines digabung ke satu fungsi (_klines_to_df) supaya
+     jalur host utama dan jalur proxy tidak bisa berbeda lagi.
+  4. /analyze_multi menerima parameter `timeframes` (mis. "M1,M5,M15").
 """
 import os
 import math
@@ -29,13 +39,48 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel
 
-# Reuse engine analisis yang sudah teruji (skor, indikator, setup builder)
+# Reuse engine analisis yang sudah teruji (skor, indikator, setup builder).
+# Catatan: timeframe di-parse oleh server ini sendiri (lihat TF_MAP).
 from engine import (
-    resolve_symbol, parse_timeframe, analyze, build_setup, fetch_spot,
-    SYMBOL_ALIASES, TIMEFRAMES,
+    resolve_symbol, analyze, build_setup, fetch_spot,
 )
+
+# =====================================================================
+# TIMEFRAME MAP (MT4/MT5 -> interval Binance)
+# =====================================================================
+TF_MAP = {
+    "M1":  ("1m",  "M1"),
+    "M5":  ("5m",  "M5"),
+    "M15": ("15m", "M15"),
+    "M30": ("30m", "M30"),
+    "H1":  ("1h",  "H1"),
+    "H4":  ("4h",  "H4"),
+    "D1":  ("1d",  "D1"),
+}
+
+# Alias yang ramah user / GPT (semua di-uppercase sebelum dicek).
+# Sengaja TIDAK memetakan "1M" karena di Binance "1M" = 1 bulan, bukan 1 menit.
+TF_ALIASES = {
+    "1": "M1", "5": "M5", "15": "M15", "30": "M30",
+    "60": "H1", "240": "H4", "1440": "D1",
+    "1MIN": "M1", "5MIN": "M5", "15MIN": "M15", "30MIN": "M30",
+    "1H": "H1", "4H": "H4", "1D": "D1", "D": "D1",
+    "60M": "H1", "240M": "H4",
+}
+
+
+def _parse_tf(timeframe: str):
+    """Kembalikan (interval_binance, label). Raise ValueError bila tidak dikenal."""
+    key = (timeframe or "").strip().upper()
+    key = TF_ALIASES.get(key, key)
+    if key not in TF_MAP:
+        raise ValueError(
+            f"Timeframe '{timeframe}' tidak dikenal. "
+            f"Gunakan salah satu: {', '.join(TF_MAP.keys())}."
+        )
+    return TF_MAP[key]
+
 
 # =====================================================================
 # DATA LAYER (server-side, multi-host + proxy fallback)
@@ -52,6 +97,27 @@ BINANCE_HOSTS = [
 ]
 CORS_PROXY = "https://corsproxy.io/?url="
 
+KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume",
+              "close_time", "qav", "trades", "tbb", "tbq", "ignore"]
+NUMERIC_COLS = ["open", "high", "low", "close", "volume",
+                "qav", "trades", "tbb", "tbq"]
+
+
+def _klines_to_df(raw) -> pd.DataFrame:
+    """
+    Ubah respons klines Binance menjadi DataFrame.
+
+    PENTING: kolom tbb (taker buy base volume) dan tbq WAJIB dipertahankan,
+    karena engine.analyze() memakainya untuk Order Flow Delta / CVD.
+    """
+    df = pd.DataFrame(raw, columns=KLINE_COLS)
+    df = df.drop(columns=["ignore"])
+    for c in NUMERIC_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    return df
+
 
 def _fetch_klines_robust(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     """Ambil candlestick dari Binance dengan fallback multi-host + CORS proxy."""
@@ -62,14 +128,7 @@ def _fetch_klines_robust(symbol: str, interval: str, limit: int = 300) -> pd.Dat
         try:
             r = requests.get(url, timeout=15)
             if r.ok:
-                cols = ["open_time", "open", "high", "low", "close", "volume",
-                        "close_time", "qav", "trades", "tbb", "tbq", "ignore"]
-                df = pd.DataFrame(r.json(), columns=cols)
-                df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-                for c in ["open", "high", "low", "close", "volume"]:
-                    df[c] = df[c].astype(float)
-                df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-                return df
+                return _klines_to_df(r.json())
             last_err = f"{host} HTTP {r.status_code}"
         except Exception as e:
             last_err = f"{host} {type(e).__name__}"
@@ -78,17 +137,10 @@ def _fetch_klines_robust(symbol: str, interval: str, limit: int = 300) -> pd.Dat
         full = "https://api.binance.com" + path
         r = requests.get(CORS_PROXY + requests.utils.quote(full, safe=""), timeout=20)
         if r.ok:
-            cols = ["open_time", "open", "high", "low", "close", "volume",
-                    "close_time", "qav", "trades", "tbb", "tbq", "ignore"]
-            df = pd.DataFrame(r.json(), columns=cols)
-            df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-            for c in ["open", "high", "low", "close", "volume"]:
-                df[c] = df[c].astype(float)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            return df
-        last_err += f" | proxy HTTP {r.status_code}"
+            return _klines_to_df(r.json())
+        last_err = f"{last_err or ''} | proxy HTTP {r.status_code}"
     except Exception as e:
-        last_err += f" | proxy {type(e).__name__}"
+        last_err = f"{last_err or ''} | proxy {type(e).__name__}"
     raise RuntimeError(f"Tidak bisa ambil data {symbol} dari semua sumber. ({last_err})")
 
 
@@ -108,7 +160,7 @@ def _f(x):
 
 def build_response(symbol: str, timeframe: str, rr: float = 2.0) -> dict:
     display, bsym, is_alias = resolve_symbol(symbol)
-    bint, tf_label = parse_timeframe(timeframe)
+    bint, tf_label = _parse_tf(timeframe)
     df = _fetch_klines_robust(bsym, bint, limit=300)
     if df.empty:
         raise RuntimeError(f"Data kosong untuk {symbol}")
@@ -176,7 +228,7 @@ def build_response(symbol: str, timeframe: str, rr: float = 2.0) -> dict:
 # =====================================================================
 app = FastAPI(
     title="AI Trading Analysis API",
-    version="1.0.0",
+    version="1.0.1",
     description=(
         "Backend analisis trading (analysis-only, no auto-execution). "
         "Menghitung Entry / Stop Loss / Take Profit / Confidence dari "
@@ -195,7 +247,12 @@ app.add_middleware(
 
 @app.get("/health", summary="Health check", description="Cek server hidup.")
 def health():
-    return {"status": "ok", "service": "ai-trading-analysis", "ts": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "service": "ai-trading-analysis",
+        "timeframes": list(TF_MAP.keys()),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get(
@@ -218,23 +275,44 @@ def analyze_endpoint(
     except ValueError as e:
         return {"error": "bad_request", "message": str(e)}
     except Exception as e:
-        return {"error": "server_error", "message": str(e)}
+        return {"error": "server_error", "message": f"{type(e).__name__}: {e}"}
 
 
 @app.get(
     "/analyze_multi",
     summary="Analisa multi-timeframe (confluence)",
     description=(
-        "Jalankan analisis pada 3 timeframe (M15, H1, H4) sekaligus dan "
-        "hitung confluence (kesepakatan arah). Bila ketiga timeframe searah, "
+        "Jalankan analisis pada beberapa timeframe sekaligus dan hitung "
+        "confluence (kesepakatan arah). Default: M15, H1, H4. Ubah lewat "
+        "parameter `timeframes` (dipisah koma, mis. 'M1,M5,M15' untuk scalping "
+        "atau 'M30,H1,H4'). Maksimal 6 timeframe. Bila semua timeframe searah, "
         "setup jauh lebih kuat. Berguna untuk konfirmasi sebelum entry manual."
     ),
 )
 def analyze_multi_endpoint(
     symbol: str = Query("BTCUSDT", description="Simbol, mis. BTCUSDT atau XAUUSD."),
     rr: float = Query(2.0, ge=0.5, le=10, description="Target Risk:Reward (default 2)."),
+    timeframes: str = Query(
+        "M15,H1,H4",
+        description="Daftar timeframe dipisah koma, mis. 'M1,M5,M15'. Pilihan: M1, M5, M15, M30, H1, H4, D1.",
+    ),
 ):
-    frames = ["M15", "H1", "H4"]
+    # Parse & validasi daftar timeframe (buang duplikat, jaga urutan)
+    frames = []
+    try:
+        for raw in timeframes.split(","):
+            if not raw.strip():
+                continue
+            label = _parse_tf(raw)[1]
+            if label not in frames:
+                frames.append(label)
+    except ValueError as e:
+        return {"error": "bad_request", "message": str(e)}
+    if not frames:
+        return {"error": "bad_request", "message": "Parameter timeframes kosong."}
+    if len(frames) > 6:
+        return {"error": "bad_request", "message": "Maksimal 6 timeframe per permintaan."}
+
     results = []
     dirs = []
     for tf in frames:
@@ -243,18 +321,23 @@ def analyze_multi_endpoint(
             results.append(r)
             dirs.append(r["direction"])
         except Exception as e:
-            results.append({"timeframe": tf, "error": str(e)})
-    # confluence
+            results.append({"timeframe": tf, "error": f"{type(e).__name__}: {e}"})
+            dirs.append("ERROR")
+
+    # confluence (dihitung terhadap jumlah timeframe yang diminta)
+    n = len(frames)
     longs = dirs.count("LONG")
     shorts = dirs.count("SHORT")
-    if longs == 3:
+    if n == 1:
+        confluence = f"SINGLE TIMEFRAME ({dirs[0]}) — tidak ada confluence"
+    elif longs == n:
         confluence = "STRONG LONG"
-    elif shorts == 3:
+    elif shorts == n:
         confluence = "STRONG SHORT"
-    elif longs == 2:
-        confluence = "WEAK LONG (2/3 searah)"
-    elif shorts == 2:
-        confluence = "WEAK SHORT (2/3 searah)"
+    elif longs > n / 2:
+        confluence = f"WEAK LONG ({longs}/{n} searah)"
+    elif shorts > n / 2:
+        confluence = f"WEAK SHORT ({shorts}/{n} searah)"
     else:
         confluence = "NO CONFLUENCE (arah campur)"
     return {
@@ -272,13 +355,14 @@ def _custom_openapi():
         return app.openapi_schema
     schema = get_openapi(
         title="AI Trading Analysis API",
-        version="1.0.0",
+        version="1.0.1",
         description=(
             "Analisis trading otomatis (analysis-only, TIDAK ada eksekusi order). "
             "Mengembalikan arah trade, Entry, Stop Loss, Take Profit (TP1/TP2/TP3), "
             "Risk:Reward, Confidence %, dan alasan berbasis indikator "
-            "(EMA, RSI, MACD, Bollinger, ATR). Gunakan action 'analyze' untuk satu "
-            "timeframe, atau 'analyze_multi' untuk confluence M15+H1+H4."
+            "(EMA, RSI, MACD, Bollinger, ATR). Timeframe: M1, M5, M15, M30, H1, H4, D1. "
+            "Gunakan action 'analyze' untuk satu timeframe, atau 'analyze_multi' "
+            "untuk confluence beberapa timeframe (default M15+H1+H4)."
         ),
         routes=app.routes,
     )
