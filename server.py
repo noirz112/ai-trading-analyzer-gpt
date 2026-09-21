@@ -141,14 +141,19 @@ def build_response(symbol: str, timeframe: str, rr: float = 2.0) -> dict:
             "proxy_spread_pct": round(spot_spread_pct, 3) if spot_spread_pct is not None else None,
         },
         "setup": {
-            "entry": _f(s["entry"]),
-            "stop_loss": _f(s["sl"]),
-            "tp1": _f(s["tp1"]),
-            "tp2": _f(s["tp2"]),
-            "tp3": _f(s["tp3"]),
-            "risk_per_unit": risk,
+            "entry": _f(s["entry"]) if s["direction"] != "NEUTRAL" else None,
+            "stop_loss": _f(s["sl"]) if s["direction"] != "NEUTRAL" else None,
+            "tp1": _f(s["tp1"]) if s["direction"] != "NEUTRAL" else None,
+            "tp2": _f(s["tp2"]) if s["direction"] != "NEUTRAL" else None,
+            "tp3": _f(s["tp3"]) if s["direction"] != "NEUTRAL" else None,
+            "risk_per_unit": risk if s["direction"] != "NEUTRAL" else None,
             "risk_reward": round(rr_actual, 2) if rr_actual is not None else None,
-            "sl_distance": _f(s["sl_dist"]),
+            "sl_distance": _f(s["sl_dist"]) if s["direction"] != "NEUTRAL" else None,
+            "note": (
+                "Tidak ada setup jelas (NEUTRAL) — tunggu konfirmasi arah. "
+                "Skor berada di rentang -20..+20 (tidak cukup kuat untuk LONG/SHORT)."
+                if s["direction"] == "NEUTRAL" else None
+            ),
         },
         "indicators": {
             "rsi14": _f(a["rsi"]),
