@@ -36,6 +36,7 @@ from engine import (
     resolve_symbol, parse_timeframe, fetch_klines, symbol_has_futures,
     analyze_crypto, analyze_xau, build_setup, fetch_spot_crosscheck,
     fetch_cot_gold, fetch_live_price, print_report, plot_chart,
+    classify_order_type,
 )
 
 app = FastAPI(
@@ -102,6 +103,21 @@ def analyze(
         spot_price, spot_label = fetch_spot_crosscheck(bsym)
         cot_data = fetch_cot_gold() if (cot and asset_class == "xau") else None
 
+        # PENTING: entry/sl/tp di atas dihitung dari harga proxy (PAXGUSDT
+        # atau gold-api), BUKAN dari feed broker user (mis. icMarkets).
+        # Selisih antara keduanya bisa $1-5 tergantung venue/lag. Kalau ini
+        # tidak ditonjolkan sebagai field terpisah, GPT sering skip
+        # menyebutkannya dan user menyangka entry itu langsung market-ready
+        # di broker mereka. order_type juga diklasifikasikan ulang di sini
+        # (BUY/SELL LIMIT vs STOP vs MARKET) dengan membandingkan entry ke
+        # spot_price -- bukan sekadar label generik "LIMIT/MARKET".
+        order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
+        spot_spread = None
+        spot_spread_pct = None
+        if spot_price:
+            spot_spread = a["price"] - spot_price
+            spot_spread_pct = (spot_spread / spot_price * 100) if spot_price else None
+
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             print_report(display, bsym, tf_label, a, s, asset_class,
@@ -129,6 +145,7 @@ def analyze(
             "asset_class": asset_class,
             "direction": s["direction"],
             "entry": s["entry"],
+            "entry_basis": "harga proxy (PAXGUSDT/gold-api), bukan feed broker -- lihat spot_price/spot_spread",
             "sl": s["sl"],
             "tp1": s["tp1"],
             "tp2": s["tp2"],
@@ -136,6 +153,19 @@ def analyze(
             "confidence": round(s["conf"], 1),
             "score": a["score"],
             "price_is_live": a.get("price_is_live", False),
+            # Harga referensi spot XAUUSD real (jauh lebih dekat ke broker
+            # user daripada proxy PAXGUSDT), dan selisihnya terhadap harga
+            # yang dipakai untuk hitung entry.
+            "spot_price": spot_price,
+            "spot_label": spot_label,
+            "spot_spread": spot_spread,
+            "spot_spread_pct": spot_spread_pct,
+            # Klasifikasi order berdasarkan posisi entry vs spot_price:
+            # BUY/SELL LIMIT atau STOP = pending order (harga belum sampai
+            # level entry), MARKET = entry sudah dekat harga sekarang.
+            # type bisa None kalau spot_price gagal diambil.
+            "order_type": order_type_detail["type"] or s["order_type"],
+            "order_type_note": order_type_detail["note"],
             "report": report_text,
             "chart_url": chart_url,
         }
