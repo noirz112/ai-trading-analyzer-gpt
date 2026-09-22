@@ -122,6 +122,7 @@ def analyze(
             "tp3": s["tp3"],
             "confidence": round(s["conf"], 1),
             "score": a["score"],
+            "price_is_live": a.get("price_is_live", False),
             "report": report_text,
             "chart_url": chart_url,
         }
