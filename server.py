@@ -42,6 +42,9 @@ app = FastAPI(
     title="AI Trading Analyzer API",
     description="Backend untuk Custom GPT — analisa liquidity/structure-based XAU & crypto.",
     version="1.0.0",
+    servers=[
+        {"url": "https://ai-trading-analyzer-gpt-production.up.railway.app"},
+    ],
 )
 
 CHART_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charts")
