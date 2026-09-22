@@ -146,14 +146,28 @@ def fetch_live_price(symbol: str):
     Dipakai sebagai 'harga sekarang' / basis Entry, terpisah dari klines yang
     dipakai untuk struktur (VWAP/POC/pool/swing) -- supaya Entry tidak basi
     sampai hampir 1 candle penuh saat candle timeframe besar (H4/D1) belum
-    tutup."""
-    try:
-        r = requests.get(f"{BINANCE_SPOT_KLINES.rsplit('/', 1)[0]}/ticker/price",
-                          params={"symbol": symbol.upper()}, timeout=8)
-        r.raise_for_status()
-        return float(r.json()["price"])
-    except Exception:
-        return None
+    tutup. Coba data-api.binance.vision dulu (konsisten dgn fetch_klines),
+    fallback ke api.binance.com kalau gagal -- lalu log alasannya ke stderr
+    supaya kelihatan di Railway logs kalau dua-duanya gagal."""
+    endpoints = [
+        "https://data-api.binance.vision/api/v3/ticker/price",
+        "https://api.binance.com/api/v3/ticker/price",
+    ]
+    last_err = None
+    for url in endpoints:
+        try:
+            r = requests.get(
+                url, params={"symbol": symbol.upper()}, timeout=10,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; ai-trading-analyzer/1.0)"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            return float(data["price"])
+        except Exception as e:
+            last_err = f"{url} -> {type(e).__name__}: {e}"
+            continue
+    print(f"[fetch_live_price] gagal untuk {symbol}: {last_err}", file=sys.stderr)
+    return None
 
 
 def fetch_spot_crosscheck(binance_symbol: str):
