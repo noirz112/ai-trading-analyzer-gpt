@@ -125,6 +125,52 @@ OB_BUFFER_PCT = 0.0005          # 0.05% dari harga entry, buffer DI LUAR edge OB
                                  # (starting parameter -- lihat SOP: rumus tetap "edge OB +
                                  # buffer", cuma angka ini yang boleh disetel ulang nanti)
 
+# --- Fitur baru (2026-09-22): VP refine / liquidity void / trapped traders --
+# Semua pakai data yang SUDAH ditarik (klines), tidak ada API call baru.
+# Semua parameter di bawah SUDAH DIKALIBRASI 2026-09-22 (lihat catatan per
+# parameter). Tetap berlaku SOP OB_IMPULSE_BODY_MULT: kalau nanti ada bukti
+# baru (misal validasi data H4 riil) yang bertentangan, re-kalibrasi dari
+# sampling bersih -- jangan asumsikan benar selamanya dari sampling ini.
+VP_HVN_RATIO = 2.0                # REVISI 2026-09-22 (v2). Riwayat: 4.0 (kalibrasi sintetis
+                                  # awal) dead-on-arrival di data riil (HVN=0 selalu). 2.2
+                                  # (revisi v1, tervalidasi cuma di 1 simbol/1 periode)
+                                  # TERBUKTI TIDAK ROBUST begitu diuji lebih luas -- gagal
+                                  # (HVN zones=0) di 2/42 window pada validasi independen:
+                                  # 6 simbol/periode (PAXGUSDT/BTCUSDT/ETHUSDT x recent/older,
+                                  # H4, ~1000 candle @Apr-Sep2026 & @Apr-Sep2025) x 7 sub-window
+                                  # (full, last500/250/150/100, first250, middle250) = 42
+                                  # kombinasi, dijalankan LANGSUNG lewat volume_profile() asli
+                                  # di file ini (bukan reimplementasi terpisah). 2.0 = 0/42 gagal
+                                  # -> dipilih. CATATAN JUJUR: tetap baru diuji di 3 simbol,
+                                  # rentang waktu Apr2025-Sep2026 -- re-cek kalau ada aset/periode
+                                  # lain yang perilakunya beda.
+VP_LVN_RATIO = 0.20              # REVISI 2026-09-22 (v2). Nilai lama 0.05 (diklaim "fp rate
+                                  # nyaris 0" dari 1 simbol) ternyata gagal (LVN zones=0) di
+                                  # 6/42 window pada validasi independen di atas (~14%, BUKAN
+                                  # "hampir selalu mati"/92% seperti sempat diklaim di sesi
+                                  # chat sebelumnya -- klaim itu TIDAK bisa direproduksi saat
+                                  # saya jalankan ulang volume_profile() asli terhadap data
+                                  # yang sama; kemungkinan salah hitung atau salah kutip di sesi
+                                  # itu, bukan bug di kode). 0.10 gagal 2/42, 0.15 gagal 1/42,
+                                  # 0.20 gagal 0/42 -> dipilih karena paling bersih, meski
+                                  # trade-off-nya zona LVN jadi lebih sedikit/lebih ketat
+                                  # definisinya. Re-cek kalau fitur liquidity void di live
+                                  # terasa terlalu jarang muncul.
+TRAPPED_REVERSAL_LOOKAHEAD = 5  # dikalibrasi 2026-09-22: 3->5, konsisten top-3 di 3 sweep
+                                 # (repeat 20/40/80), turunkan worst-case FP ~0.7->0.35-0.4
+                                 # dengan recall rata2 tetap ~0.6-0.7 (lihat catatan struktural
+                                 # di bawah soal batas noise H4). RE-VALIDASI INDEPENDEN
+                                 # 2026-09-22 (v2): dijalankan langsung via find_swings() +
+                                 # find_liquidity_pools() + mark_swept_pools() +
+                                 # detect_trapped_traders() asli di 6 dataset H4 riil
+                                 # (PAXGUSDT/BTCUSDT/ETHUSDT x recent/older) -> conversion
+                                 # per dataset 33-76%, gabungan 47/91=51.6% (mirip angka yang
+                                 # diklaim sesi sebelumnya, ~60% -- sedikit lebih rendah tapi
+                                 # dalam rentang wajar, TIDAK ada tanda fitur mati). n=91 swept
+                                 # events masih kecil untuk klaim statistik kuat; treat sebagai
+                                 # indikatif, bukan final.
+TRAPPED_REVERSAL_MIN_PCT = 0.002  # dikalibrasi 2026-09-22: 0.001->0.002 (lihat catatan di atas)
+
 # Cache in-memory sederhana untuk fetch TwelveData (hindari boros quota plan Basic:
 # 8 request/menit, 800/hari). TTL = durasi 1 candle sesuai timeframe yang diminta.
 _TD_CACHE = {}
@@ -714,7 +760,108 @@ def volume_profile(df: pd.DataFrame, bins: int = 24, value_area_pct: float = 0.7
             break
     vah = float(edges[hi + 1])
     val = float(edges[lo])
-    return {"poc": poc_price, "vah": vah, "val": val, "edges": edges, "vol_bins": vol_bins}
+
+    # --- Refinement: High/Low Volume Node (HVN/LVN) --------------------------
+    # HVN = bin volume jauh di atas rata-rata -> zona "acceptance" (harga
+    #       cenderung berlama-lama/rotate di situ).
+    # LVN = bin volume jauh di bawah rata-rata -> zona harga dilewati cepat,
+    #       jadi kandidat "liquidity void" (lihat find_liquidity_voids()).
+    nonzero = vol_bins[vol_bins > 0]
+    avg_bin_vol = float(nonzero.mean()) if len(nonzero) else 0.0
+    hvn_zones, lvn_zones = [], []
+    if avg_bin_vol > 0:
+        for i in range(bins):
+            v = float(vol_bins[i])
+            zone = {"price_low": float(edges[i]), "price_high": float(edges[i + 1]), "volume": v}
+            if v >= VP_HVN_RATIO * avg_bin_vol:
+                hvn_zones.append(zone)
+            elif v <= VP_LVN_RATIO * avg_bin_vol:
+                lvn_zones.append(zone)
+    hvn_zones = _merge_adjacent_zones(hvn_zones)
+    lvn_zones = _merge_adjacent_zones(lvn_zones)
+
+    return {"poc": poc_price, "vah": vah, "val": val, "edges": edges, "vol_bins": vol_bins,
+            "hvn": hvn_zones, "lvn": lvn_zones}
+
+
+def _merge_adjacent_zones(zones: list):
+    """Gabungkan bin-bin harga yang bersebelahan (edge nyambung) jadi satu zona lebih lebar."""
+    if not zones:
+        return []
+    merged = [dict(zones[0])]
+    for z in zones[1:]:
+        last = merged[-1]
+        if abs(z["price_low"] - last["price_high"]) < 1e-12:
+            last["price_high"] = z["price_high"]
+            last["volume"] += z["volume"]
+        else:
+            merged.append(dict(z))
+    return merged
+
+
+def find_liquidity_voids(price: float, vp: dict, max_zones: int = 3):
+    """
+    Liquidity void = zona LVN (Low Volume Node) dari volume profile di atas --
+    area harga yang historisnya dilewati cepat dengan sedikit volume, jadi
+    "kosong" dan cenderung ditarik/diisi cepat kalau harga lewat situ lagi.
+
+    Basisnya DISTRIBUSI VOLUME per level harga (vp["lvn"]), BUKAN gap 3-candle
+    OHLC seperti find_fair_value_gaps() -- jadi ini fitur genuine baru, bukan
+    relabeling FVG, meski konsepnya serupa ("magnet" harga).
+    """
+    voids = []
+    for z in vp.get("lvn", []):
+        mid = (z["price_low"] + z["price_high"]) / 2
+        voids.append({
+            "price_low": z["price_low"], "price_high": z["price_high"],
+            "mid": mid, "volume": z["volume"],
+            "side": "above" if mid > price else "below",
+            "width_pct": ((z["price_high"] - z["price_low"]) / price) if price else 0.0,
+        })
+    voids.sort(key=lambda v: abs(v["mid"] - price))
+    return voids[:max_zones]
+
+
+def detect_trapped_traders(df: pd.DataFrame, pools: list,
+                            lookahead: int = TRAPPED_REVERSAL_LOOKAHEAD,
+                            min_reversal_pct: float = TRAPPED_REVERSAL_MIN_PCT):
+    """
+    Trapped buyers/sellers -- dibangun DI ATAS mark_swept_pools() yang sudah
+    ada (bukan data baru, bukan order book): pool yang disapu (swept) lalu
+    harga GAGAL lanjut & reverse balik arah dalam `lookahead` candle = jejak
+    trader yang entry di breakout palsu dan sekarang "terjebak".
+
+    - Sweep buyside (equal high disapu) lalu reverse turun -> TRAPPED BUYERS.
+    - Sweep sellside (equal low disapu) lalu reverse naik  -> TRAPPED SELLERS.
+
+    df harus konsisten dengan `pools` yang dipakai (struct_df untuk XAU,
+    df biasa untuk crypto) -- sama seperti mark_swept_pools().
+    """
+    events = []
+    for p in pools:
+        if not p.get("swept"):
+            continue
+        seg = df.iloc[p["last_idx"] + 1:]
+        if seg.empty:
+            continue
+        sweep_mask = (seg["high"] > p["price"]) if p["side"] == "buyside" else (seg["low"] < p["price"])
+        if not sweep_mask.any():
+            continue
+        sweep_pos = sweep_mask.idxmax()
+        sweep_iloc = df.index.get_loc(sweep_pos)
+        after = df.iloc[sweep_iloc + 1: sweep_iloc + 1 + lookahead]
+        if after.empty:
+            continue
+        last_close = float(after["close"].iloc[-1])
+        kind = None
+        if p["side"] == "buyside" and last_close < p["price"] * (1 - min_reversal_pct):
+            kind = "trapped_buyers"
+        elif p["side"] == "sellside" and last_close > p["price"] * (1 + min_reversal_pct):
+            kind = "trapped_sellers"
+        if kind:
+            events.append({"kind": kind, "pool_price": p["price"], "pool_side": p["side"],
+                            "touches": p["touches"], "confirm_close": last_close})
+    return events
 
 
 def anchored_vwap(df: pd.DataFrame, anchor_ts=None):
@@ -839,6 +986,8 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
     funding = fetch_funding_rate(symbol) if has_futures else None
     oi = fetch_open_interest(symbol) if has_futures else None
     magnet = liquidation_magnet_proxy(price, pools, funding, oi)
+    trapped = detect_trapped_traders(df, pools)
+    voids = find_liquidity_voids(price, vp)
 
     score = 0.0
     reasons = []
@@ -948,12 +1097,54 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
     else:
         reasons.append("Open Interest: data tidak tersedia")
 
+    # 8) Trapped buyers/sellers (fitur baru, lihat detect_trapped_traders())
+    for ev in trapped:
+        if ev["kind"] == "trapped_buyers":
+            score -= 10
+            reasons.append(f"Trapped buyers: buyside liquidity @ {ev['pool_price']:.4f} disapu "
+                            f"({ev['touches']}x equal high) lalu harga reverse turun (close "
+                            f"{ev['confirm_close']:.4f}) -> potensi bahan bakar tekanan jual lanjutan")
+        else:
+            score += 10
+            reasons.append(f"Trapped sellers: sellside liquidity @ {ev['pool_price']:.4f} disapu "
+                            f"({ev['touches']}x equal low) lalu harga reverse naik (close "
+                            f"{ev['confirm_close']:.4f}) -> potensi bahan bakar tekanan beli lanjutan")
+
+    # 9) Liquidity void (LVN dari volume profile) -- INFORMASIONAL, TIDAK
+    #    menambah skor (biar tidak dobel-hitung dengan POC/VAH/VAL di atas).
+    #    Berguna sebagai referensi target/TP: harga cenderung "mengisi" void
+    #    dengan cepat kalau ditarik ke situ.
+    for v in voids[:2]:
+        reasons.append(f"Liquidity void (LVN) {v['side']} harga di {v['price_low']:.4f}-"
+                        f"{v['price_high']:.4f} (volume tipis di histori) -> kandidat target "
+                        f"kalau harga bergerak ke arah situ, cenderung dilewati cepat")
+
+    # 10) AMT (Auction Market Theory) -- INTERPRETASI di atas Volume Profile
+    #     yang sudah dihitung (poin 4), BUKAN faktor skor terpisah, supaya
+    #     tidak menghitung ulang sinyal VAH/VAL/POC dengan nama berbeda.
+    reasons.append(f"[AMT] POC {vp['poc']:.4f} = fair value price; area value "
+                    f"{vp['val']:.4f}-{vp['vah']:.4f} = zona acceptance -- harga di luar area "
+                    f"ini menandakan potensi rejection/ekstensi (bukan skor tambahan)")
+
+    # 11) MM inventory (PROXY) -- sintesis funding+OI+CVD yang SUDAH dihitung
+    #     di atas (poin 5-7), BUKAN skor baru (funding/OI/CVD sudah observable
+    #     riil, ini cuma reprocessing jadi satu narasi -- MM inventory asli
+    #     tidak observable dari data publik).
+    if funding and oi and oi.get("trend") is not None:
+        rate = funding["rate"]
+        bias_txt = "short" if rate > 0 else ("long" if rate < 0 else "netral")
+        reasons.append(f"[MM inventory - PROXY] funding {rate:+.4%} + OI trend "
+                        f"{oi['trend']:+.2f} + CVD trend {cvd_trend:+.2f} -> estimasi kasar "
+                        f"dealer/MM condong sisi {bias_txt} (sintesis 3 faktor di atas, "
+                        f"bukan data posisi riil, tidak menambah skor)")
+
     return dict(
         score=score, reasons=reasons, price=price,
         structure=structure, pools=pools, fvgs=fvgs, vp=vp, vwap=vwap_val,
         delta=delta_now, cvd_trend=cvd_trend, funding=funding, oi=oi, magnet=magnet,
         swing_h=swing_h, swing_l=swing_l,
         order_blocks=order_blocks, structure_source="native",
+        trapped=trapped, voids=voids,
     )
 
 
@@ -1008,6 +1199,8 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
     funding = fetch_funding_rate(symbol) if has_futures else None
     oi = fetch_open_interest(symbol) if has_futures else None
     magnet = liquidation_magnet_proxy(price, pools, funding, oi) if has_futures else None
+    trapped = detect_trapped_traders(struct_df, pools)
+    voids = find_liquidity_voids(price, vp)
 
     score = 0.0
     reasons = []
@@ -1106,6 +1299,42 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
         reasons.append("Funding/OI/liquidation magnet PAXGUSDT: kontrak futures tidak terdeteksi, "
                         "bagian ini dilewati (bobot dialihkan ke struktur/VWAP/macro)")
 
+    # 7) Trapped buyers/sellers (fitur baru, lihat detect_trapped_traders())
+    for ev in trapped:
+        if ev["kind"] == "trapped_buyers":
+            score -= 10
+            reasons.append(f"Trapped buyers: buyside liquidity @ {ev['pool_price']:.4f} disapu "
+                            f"({ev['touches']}x equal high) lalu harga reverse turun (close "
+                            f"{ev['confirm_close']:.4f}) -> potensi bahan bakar tekanan jual lanjutan")
+        else:
+            score += 10
+            reasons.append(f"Trapped sellers: sellside liquidity @ {ev['pool_price']:.4f} disapu "
+                            f"({ev['touches']}x equal low) lalu harga reverse naik (close "
+                            f"{ev['confirm_close']:.4f}) -> potensi bahan bakar tekanan beli lanjutan")
+
+    # 8) Liquidity void (LVN dari volume profile) -- INFORMASIONAL, TIDAK
+    #    menambah skor (sudah dihitung via POC/VAH/VAL di poin 3).
+    for v in voids[:2]:
+        reasons.append(f"Liquidity void (LVN) {v['side']} harga di {v['price_low']:.4f}-"
+                        f"{v['price_high']:.4f} (volume tipis di histori) -> kandidat target "
+                        f"kalau harga bergerak ke arah situ, cenderung dilewati cepat")
+
+    # 9) AMT (Auction Market Theory) -- INTERPRETASI di atas Volume Profile
+    #    yang sudah dihitung (poin 3), BUKAN faktor skor terpisah.
+    reasons.append(f"[AMT] POC {vp['poc']:.4f} = fair value price; area value "
+                    f"{vp['val']:.4f}-{vp['vah']:.4f} = zona acceptance -- harga di luar area "
+                    f"ini menandakan potensi rejection/ekstensi (bukan skor tambahan)")
+
+    # 10) MM inventory (PROXY) -- sintesis funding PAXG yang sudah dihitung
+    #     di atas (poin 6), BUKAN skor baru. XAU tidak punya CVD/OI crypto asli
+    #     jadi proxy-nya lebih tipis daripada versi crypto -- ditandai jelas.
+    if has_futures and funding:
+        rate = funding["rate"]
+        bias_txt = "short" if rate > 0 else ("long" if rate < 0 else "netral")
+        reasons.append(f"[MM inventory - PROXY, tipis] [PAXG futures] funding {rate:+.4%} -> "
+                        f"estimasi sangat kasar dealer/MM sisi crypto proxy condong {bias_txt} "
+                        f"(cuma 1 faktor, bukan data posisi riil XAUUSD, tidak menambah skor)")
+
     return dict(
         score=score, reasons=reasons, price=price,
         structure=structure, pools=pools, vp=vp, vwap=vwap_val,
@@ -1113,6 +1342,7 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
         dxy_override=dxy_bias_override, funding=funding, oi=oi, magnet=magnet,
         swing_h=swing_h, swing_l=swing_l, session_start=session_start,
         order_blocks=order_blocks, structure_source=structure_source,
+        trapped=trapped, voids=voids,
     )
 
 
@@ -1504,6 +1734,14 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
         m = a["magnet"]
         print(f"   Liquidation magnet (PROXY) : {m['direction']} harga @ {fmt(m['price'])} "
               f"(pool {m['pool_side']})")
+    if a.get("trapped"):
+        for ev in a["trapped"]:
+            label = "TRAPPED BUYERS" if ev["kind"] == "trapped_buyers" else "TRAPPED SELLERS"
+            print(f"   {label} @ {fmt(ev['pool_price'])} ({ev['touches']}x equal level, "
+                  f"reverse confirmed close {fmt(ev['confirm_close'])})")
+    if a.get("voids"):
+        for v in a["voids"][:2]:
+            print(f"   Liquidity void (LVN) {v['side']} harga : {fmt(v['price_low'])}-{fmt(v['price_high'])}")
 
     print("-" * 70)
     if asset_class == "crypto":
