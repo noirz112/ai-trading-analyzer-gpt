@@ -835,7 +835,9 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
     if order_blocks:
         ob0 = order_blocks[0]
         ob_status = "sudah dimitigasi" if ob0.get("mitigated") else "fresh, belum dimitigasi"
-        reasons.append(f"Order Block {ob0['type']} @ {ob0['low']:.4f}-{ob0['high']:.4f} ({ob_status})")
+        reasons.append(f"Order Block {ob0['type']} @ {ob0['low']:.4f}-{ob0['high']:.4f} ({ob_status}) "
+                        f"-- info struktural umum, BELUM TENTU dipakai untuk entry; "
+                        f"cek baris 'Order Block dipakai' di atas (kosong = tidak dipakai/FALLBACK)")
 
     # 2) Liquidity pool / magnet (ERL) + FVG (IRL)
     if magnet:
@@ -1003,7 +1005,9 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
         ob0 = order_blocks[0]
         ob_status = "sudah dimitigasi" if ob0.get("mitigated") else "fresh, belum dimitigasi"
         reasons.append(f"Order Block {ob0['type']} @ {ob0['low']:.4f}-{ob0['high']:.4f} ({ob_status}) "
-                        f"[sumber struktur: {structure_source}]")
+                        f"[sumber struktur: {structure_source}] "
+                        f"-- info struktural umum, BELUM TENTU dipakai untuk entry; "
+                        f"cek baris 'Order Block dipakai' di atas (kosong = tidak dipakai/FALLBACK)")
 
     # 2) VWAP sesi London-NY overlap
     if price > vwap_val:
