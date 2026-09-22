@@ -55,6 +55,7 @@ CARA PAKAI:
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -76,6 +77,17 @@ FX_LATEST_URL = "https://api.frankfurter.app/latest"
 FX_RANGE_URL = "https://api.frankfurter.app/{start}..{end}"
 GOLD_SPOT_URL = "https://api.gold-api.com/price/XAU"
 CFTC_COT_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+
+TWELVEDATA_BASE = "https://api.twelvedata.com/time_series"
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+TWELVEDATA_XAU_SYMBOL = "XAU/USD"
+TWELVEDATA_INTERVAL_MAP = {
+    "M1": "1min", "M5": "5min", "M15": "15min", "M30": "30min",
+    "H1": "1h", "H4": "4h", "D1": "1day",
+}
+TIMEFRAME_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400,
+}
 
 SYMBOL_ALIASES = {
     "XAUUSD": "PAXGUSDT",
@@ -100,6 +112,17 @@ LONDON_NY_OVERLAP_END_UTC = 16
 NEUTRAL_THRESHOLD = 25          # zona skor -25..+25 dianggap NEUTRAL
 LIQUIDITY_TOL_PCT = 0.0015      # toleransi 0.15% untuk deteksi equal high/low
 FUNDING_EXTREME = 0.0005        # 0.05% dianggap funding "panas"
+
+# --- SOP Order Block (lihat dokumen SOP proyek) -----------------------------
+OB_IMPULSE_BODY_MULT = 1.5      # candle "impulsif" = body >= 1.5x rata-rata body 20 candle
+                                 # sebelumnya (starting parameter, boleh dikalibrasi ulang)
+OB_BUFFER_PCT = 0.0005          # 0.05% dari harga entry, buffer DI LUAR edge OB
+                                 # (starting parameter -- lihat SOP: rumus tetap "edge OB +
+                                 # buffer", cuma angka ini yang boleh disetel ulang nanti)
+
+# Cache in-memory sederhana untuk fetch TwelveData (hindari boros quota plan Basic:
+# 8 request/menit, 800/hari). TTL = durasi 1 candle sesuai timeframe yang diminta.
+_TD_CACHE = {}
 
 
 # =============================================================================
@@ -168,6 +191,81 @@ def fetch_live_price(symbol: str):
             continue
     print(f"[fetch_live_price] gagal untuk {symbol}: {last_err}", file=sys.stderr)
     return None
+
+
+def fetch_klines_twelvedata(td_symbol: str, tf_label: str, outputsize: int = 300) -> pd.DataFrame:
+    """
+    Ambil candle ASLI (XAUUSD, bukan proxy) dari TwelveData. Dipakai KHUSUS
+    untuk layer STRUKTUR (swing/BOS/FVG/liquidity pool/Order Block) sesuai
+    SOP hybrid proyek ini. Volume/VWAP/reaksi-candle TETAP dari PAXGUSDT
+    (lihat analyze_xau) karena volume forex/XAU di TwelveData tidak reliable
+    -- kolom volume di sini sengaja diisi 0, JANGAN dipakai untuk apa pun.
+
+    Caching in-memory per (symbol, interval) dengan TTL = durasi 1 candle,
+    supaya hemat quota (plan Basic = 8 request/menit, 800/hari).
+    Melempar exception kalau API key belum ada / request gagal / limit habis
+    -- pemanggil (get_structure_df) yang bertanggung jawab fallback.
+    """
+    td_interval = TWELVEDATA_INTERVAL_MAP.get(tf_label)
+    if not td_interval:
+        raise ValueError(f"Timeframe '{tf_label}' tidak dipetakan ke interval TwelveData")
+    if not TWELVEDATA_API_KEY:
+        raise RuntimeError("TWELVEDATA_API_KEY belum di-set (env var kosong)")
+
+    cache_key = (td_symbol, td_interval)
+    ttl = TIMEFRAME_SECONDS.get(tf_label, 3600)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _TD_CACHE.get(cache_key)
+    if cached and (now_ts - cached["ts"]) < ttl:
+        return cached["df"].copy()
+
+    params = {
+        "symbol": td_symbol, "interval": td_interval, "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY, "order": "ASC",
+    }
+    r = requests.get(TWELVEDATA_BASE, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or "values" not in data:
+        raise RuntimeError(f"TwelveData response tidak valid: {data}")
+
+    df = pd.DataFrame(data["values"]).rename(columns={"datetime": "open_time"})
+    for c in ["open", "high", "low", "close"]:
+        df[c] = df[c].astype(float)
+    df["volume"] = 0.0   # sengaja kosong -- lihat catatan di docstring
+    df["tbb"] = 0.0
+    df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+    df = df.sort_values("open_time").reset_index(drop=True)
+    df = df[["open_time", "open", "high", "low", "close", "volume", "tbb"]]
+
+    _TD_CACHE[cache_key] = {"df": df.copy(), "ts": now_ts}
+    return df
+
+
+def get_structure_df(asset_class: str, tf_label: str, fallback_df: pd.DataFrame):
+    """
+    Tentukan DataFrame mana yang dipakai untuk layer struktur (swing/BOS/FVG/
+    liquidity pool/Order Block), sesuai SOP hybrid:
+      - crypto  -> selalu df Binance sendiri (sudah data asli, tidak perlu TwelveData)
+      - xau     -> coba TwelveData (XAUUSD asli) dulu; kalau API key belum ada,
+                   request gagal, atau data terlalu sedikit -> fallback ke
+                   fallback_df (candle PAXGUSDT yang sudah ada), source
+                   ditandai eksplisit supaya laporan tidak menyamarkan ini
+                   sebagai struktur XAUUSD asli.
+    Return: (df_structure, structure_source)
+    """
+    if asset_class != "xau":
+        return fallback_df, "native"
+    if not TWELVEDATA_API_KEY:
+        return fallback_df, "paxg_fallback_no_api_key"
+    try:
+        df_td = fetch_klines_twelvedata(TWELVEDATA_XAU_SYMBOL, tf_label, outputsize=300)
+        if len(df_td) < 30:
+            return fallback_df, "paxg_fallback_insufficient_data"
+        return df_td, "twelvedata"
+    except Exception as e:
+        print(f"[get_structure_df] TwelveData gagal, fallback ke PAXGUSDT: {e}", file=sys.stderr)
+        return fallback_df, "paxg_fallback_error"
 
 
 def fetch_spot_crosscheck(binance_symbol: str):
@@ -331,7 +429,7 @@ def classify_structure(df: pd.DataFrame, swing_highs, swing_lows, n_last: int = 
     Plus deteksi Break of Structure (BOS) sederhana: close terakhir menembus
     swing high/low signifikan terakhir.
     """
-    result = {"bias": "ranging", "detail": "", "bos": None}
+    result = {"bias": "ranging", "detail": "", "bos": None, "bos_idx": None}
     if len(swing_highs) >= 2:
         last_h = [p for _, _, p in swing_highs[-n_last:]]
         hh = all(last_h[i] < last_h[i + 1] for i in range(len(last_h) - 1))
@@ -355,16 +453,19 @@ def classify_structure(df: pd.DataFrame, swing_highs, swing_lows, n_last: int = 
         result["detail"] = "Struktur campuran / konsolidasi (belum ada HH-HL atau LH-LL bersih)"
 
     last_close = df["close"].iloc[-1]
+    last_idx = len(df) - 1
     if swing_highs:
         last_swing_high = swing_highs[-1][2]
         if last_close > last_swing_high:
             result["bos"] = ("bullish", last_swing_high)
+            result["bos_idx"] = last_idx
     if swing_lows:
         last_swing_low = swing_lows[-1][2]
         if last_close < last_swing_low:
             # kalau dua-duanya break (jarang), yang paling baru menang -> cek index
             if result["bos"] is None or swing_lows[-1][0] > swing_highs[-1][0]:
                 result["bos"] = ("bearish", last_swing_low)
+                result["bos_idx"] = last_idx
     return result
 
 
@@ -444,6 +545,111 @@ def find_fair_value_gaps(df: pd.DataFrame, max_lookback: int = 60):
         if not filled:
             unfilled.append(g)
     return unfilled
+
+
+def find_order_blocks(df: pd.DataFrame, bos, bos_idx, body_mult: float = OB_IMPULSE_BODY_MULT,
+                       max_lookback: int = 40):
+    """
+    Order Block sesuai SOP proyek ini (BUKAN ICT murni): candle BERLAWANAN
+    warna TERAKHIR sebelum candle IMPULSIF yang memicu BOS. FVG saja tanpa
+    BOS TIDAK dianggap OB valid -- makanya fungsi ini butuh `bos`/`bos_idx`
+    dari classify_structure(), bukan cuma FVG independen.
+
+    "Candle impulsif" = body candle >= body_mult x rata-rata body 20 candle
+    sebelumnya, DAN searah BOS (BOS bullish -> candle impulsif naik, dst).
+
+    Return list (biasanya 0 atau 1 item) supaya pola konsisten dengan
+    find_fair_value_gaps/find_liquidity_pools.
+    """
+    if bos is None or bos_idx is None:
+        return []
+    direction, _break_level = bos
+
+    bodies = (df["close"] - df["open"]).abs()
+    hist_start = max(0, bos_idx - 20)
+    avg_body = bodies.iloc[hist_start:bos_idx].mean()
+    if not avg_body or avg_body <= 0 or np.isnan(avg_body):
+        return []
+
+    lookback_start = max(0, bos_idx - max_lookback)
+
+    # 1) cari candle impulsif: mundur dari bos_idx, body >= body_mult x avg_body,
+    #    warnanya searah BOS
+    impulse_idx = None
+    for i in range(bos_idx, lookback_start - 1, -1):
+        is_up = df["close"].iloc[i] > df["open"].iloc[i]
+        same_dir = (direction == "bullish" and is_up) or (direction == "bearish" and not is_up)
+        if same_dir and bodies.iloc[i] >= body_mult * avg_body:
+            impulse_idx = i
+            break
+    if impulse_idx is None:
+        return []
+
+    # 2) OB = candle berlawanan warna TERAKHIR sebelum candle impulsif tsb
+    ob_idx = None
+    for j in range(impulse_idx - 1, lookback_start - 1, -1):
+        is_up_j = df["close"].iloc[j] > df["open"].iloc[j]
+        if direction == "bullish" and not is_up_j:
+            ob_idx = j
+            break
+        if direction == "bearish" and is_up_j:
+            ob_idx = j
+            break
+    if ob_idx is None:
+        return []
+
+    return [{
+        "type": "bullish" if direction == "bullish" else "bearish",
+        "high": float(df["high"].iloc[ob_idx]),
+        "low": float(df["low"].iloc[ob_idx]),
+        "idx": ob_idx,
+        "impulse_idx": impulse_idx,
+        "open_time": df["open_time"].iloc[ob_idx],
+    }]
+
+
+def mark_mitigated_ob(df: pd.DataFrame, obs: list):
+    """
+    OB dianggap 'mitigated' kalau harga SUDAH balik masuk ke dalam zonanya
+    setelah OB terbentuk. OB yang sudah mitigated dianggap tidak lagi valid
+    dipakai sebagai entry baru (sudah "dipakai" sekali) -- pola sama seperti
+    mark_swept_pools().
+
+    PENTING: pengecekan dimulai SETELAH candle IMPULSIF (bukan setelah OB itu
+    sendiri) -- candle impulsif biasanya open persis di level close OB, jadi
+    kalau start-nya dari ob['idx']+1, low candle impulsif nyaris selalu
+    "menyentuh" tepi OB dan salah dianggap mitigated padahal itu cuma titik
+    awal impulsnya sendiri, bukan retest asli.
+    """
+    for ob in obs:
+        start_idx = ob.get("impulse_idx", ob["idx"]) + 1
+        seg = df.iloc[start_idx:]
+        if seg.empty:
+            ob["mitigated"] = False
+            continue
+        if ob["type"] == "bullish":
+            touched = (seg["low"] <= ob["high"]).any()
+        else:
+            touched = (seg["high"] >= ob["low"]).any()
+        ob["mitigated"] = bool(touched)
+    return obs
+
+
+def classify_tier(risk: float, tp1_dist: float, tp2_dist: float) -> str:
+    """
+    Tiering kelayakan setup sesuai SOP:
+      A = risk <= jarak TP1  -> layak penuh
+      B = risk <= jarak TP2  -> layak marjinal (TP1 belum menutup risiko)
+      C = risk > jarak TP2   -> berisiko tinggi
+    Semua tier tetap ditampilkan di report, tidak ada yang disembunyikan.
+    """
+    if risk <= 0:
+        return "C"
+    if risk <= tp1_dist:
+        return "A"
+    elif risk <= tp2_dist:
+        return "B"
+    return "C"
 
 
 def volume_profile(df: pd.DataFrame, bins: int = 24, value_area_pct: float = 0.70):
@@ -595,6 +801,8 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
     pools = find_liquidity_pools(swing_h, swing_l)
     pools = mark_swept_pools(df, pools)
     fvgs = find_fair_value_gaps(df)
+    order_blocks = find_order_blocks(df, structure.get("bos"), structure.get("bos_idx"))
+    order_blocks = mark_mitigated_ob(df, order_blocks)
     vp = volume_profile(df.tail(150))
     vwap_val, _ = anchored_vwap(df.tail(96))  # ~ jendela rolling, crypto 24/7
 
@@ -622,6 +830,10 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
         side, lvl = structure["bos"]
         score += 10 if side == "bullish" else -10
         reasons.append(f"Break of Structure {side} menembus level {lvl:.4f}")
+    if order_blocks:
+        ob0 = order_blocks[0]
+        ob_status = "sudah dimitigasi" if ob0.get("mitigated") else "fresh, belum dimitigasi"
+        reasons.append(f"Order Block {ob0['type']} @ {ob0['low']:.4f}-{ob0['high']:.4f} ({ob_status})")
 
     # 2) Liquidity pool / magnet (ERL) + FVG (IRL)
     if magnet:
@@ -716,18 +928,34 @@ def analyze_crypto(df: pd.DataFrame, symbol: str, has_futures: bool) -> dict:
         structure=structure, pools=pools, fvgs=fvgs, vp=vp, vwap=vwap_val,
         delta=delta_now, cvd_trend=cvd_trend, funding=funding, oi=oi, magnet=magnet,
         swing_h=swing_h, swing_l=swing_l,
+        order_blocks=order_blocks, structure_source="native",
     )
 
 
 # =============================================================================
 # 6. SCORING ENGINE — XAU (via PAXGUSDT, playbook hibrida)
 # =============================================================================
-def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_override=None) -> dict:
+def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_override=None,
+                 df_structure=None, structure_source="native") -> dict:
+    """
+    df            : candle PAXGUSDT (proxy) -- dipakai untuk volume profile,
+                    VWAP sesi, dan reaksi candle/vol_ratio (SOP: volume real
+                    cuma tersedia dari sini).
+    df_structure  : candle XAUUSD asli dari TwelveData (via get_structure_df)
+                    -- dipakai KHUSUS untuk swing/BOS/liquidity pool/Order
+                    Block. Kalau None, fallback ke df (perilaku lama, pra-hybrid).
+    structure_source : label asal df_structure ("twelvedata" / "paxg_fallback_*"
+                    / "native") supaya laporan transparan soal skala harga yang
+                    dipakai (lihat SOP Opsi A -- label, jangan disamarkan).
+    """
     price = float(df["close"].iloc[-1])
-    swing_h, swing_l = find_swings(df, left=3, right=3)
-    structure = classify_structure(df, swing_h, swing_l)
+    struct_df = df_structure if df_structure is not None else df
+    swing_h, swing_l = find_swings(struct_df, left=3, right=3)
+    structure = classify_structure(struct_df, swing_h, swing_l)
     pools = find_liquidity_pools(swing_h, swing_l)
-    pools = mark_swept_pools(df, pools)
+    pools = mark_swept_pools(struct_df, pools)
+    order_blocks = find_order_blocks(struct_df, structure.get("bos"), structure.get("bos_idx"))
+    order_blocks = mark_mitigated_ob(struct_df, order_blocks)
     vp = volume_profile(df.tail(150))
 
     session_df, session_start = session_window_today(
@@ -769,6 +997,11 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
         side, lvl = structure["bos"]
         score += 10 if side == "bullish" else -10
         reasons.append(f"Break of Structure {side} menembus level {lvl:.4f}")
+    if order_blocks:
+        ob0 = order_blocks[0]
+        ob_status = "sudah dimitigasi" if ob0.get("mitigated") else "fresh, belum dimitigasi"
+        reasons.append(f"Order Block {ob0['type']} @ {ob0['low']:.4f}-{ob0['high']:.4f} ({ob_status}) "
+                        f"[sumber struktur: {structure_source}]")
 
     # 2) VWAP sesi London-NY overlap
     if price > vwap_val:
@@ -852,6 +1085,7 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
         reaction=reaction, vol_ratio=vol_ratio, dxy=dxy_info,
         dxy_override=dxy_bias_override, funding=funding, oi=oi, magnet=magnet,
         swing_h=swing_h, swing_l=swing_l, session_start=session_start,
+        order_blocks=order_blocks, structure_source=structure_source,
     )
 
 
@@ -867,6 +1101,7 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
     pools = a["pools"]
     vp = a["vp"]
     swing_h, swing_l = a["swing_h"], a["swing_l"]
+    order_blocks = a.get("order_blocks", [])
 
     SCORE_MAX = 100.0
     conf = 50.0 + 40.0 * min(1.0, abs(a["score"]) / SCORE_MAX)
@@ -916,38 +1151,72 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
         return merged
 
     # Jarak SL akhir (dari entry) TIDAK BOLEH lebih kecil dari ini, apa pun
-    # posisi liquidity pool/swing terdekat. Sebelumnya floor ini cuma dipakai
-    # untuk menghitung besar buffer, bukan untuk menjamin jarak SL akhir -->
-    # itu penyebab SL bisa jadi cuma beberapa cent dari harga kalau struktur
-    # kebetulan sangat dekat. Sekarang floor ini yang menentukan jarak minimum.
+    # posisi liquidity pool/swing/OB terdekat.
     MIN_SL_PCT = 0.001  # 0.1% dari harga; naikkan kalau masih terasa terlalu ketat
 
-    if direction == "LONG":
-        sl_level = nearest_below(price)
-        if sl_level is None:
-            sl_level = price * 0.985
-        raw_dist = price - sl_level
-        min_dist = price * MIN_SL_PCT
-        dist = max(raw_dist, min_dist)
-        buffer_ = dist * 0.10
-        entry = price
-        sl = entry - dist - buffer_
-        sl_dist_final = entry - sl
+    def pick_ob(dir_):
+        """
+        OB tervalid (belum mitigated) TERDEKAT ke harga, searah trade -- sesuai
+        SOP. Untuk LONG: OB bullish yang high-nya <= harga sekarang (OB ada DI
+        BAWAH harga, karena impuls yang memicu BOS sudah membawa harga naik
+        menjauhinya) -> pilih yang high-nya paling tinggi (paling dekat ke
+        harga). Untuk SHORT: simetris terbalik.
+        """
+        want_type = "bullish" if dir_ == "LONG" else "bearish"
+        cands = [o for o in order_blocks if o["type"] == want_type and not o.get("mitigated", False)]
+        if not cands:
+            return None
+        if dir_ == "LONG":
+            cands = [o for o in cands if o["high"] <= price]
+            return max(cands, key=lambda o: o["high"]) if cands else None
+        else:
+            cands = [o for o in cands if o["low"] >= price]
+            return min(cands, key=lambda o: o["low"]) if cands else None
 
-        # TP1/TP2/TP3 = pool/swing ke-1/2/3 terdekat searah trade (LOGIC
-        # LIQUIDITY-BASED, konsisten dgn filosofi engine ini). Kalau struktur
-        # yang tersedia kurang dari 3 level, atau levelnya kurang jauh (belum
-        # 30% dari jarak SL -> terlalu dekat buat jadi target berarti), baru
-        # fallback ke kelipatan R (1R/2R/3R) seperti versi lama.
-        cand_targets = targets_above(price)
+    if direction == "NEUTRAL":
+        entry = price
+        sl = tp1 = tp2 = tp3 = price
+        risk = 0.0
+        order_type = None
+        entry_basis = None
+        ob_used = None
+        tier = None
+    elif direction == "LONG":
+        ob_used = pick_ob("LONG")
+        if ob_used is not None:
+            # Entry = edge OB (edge ATAS OB bullish). SL = edge BAWAH OB + buffer.
+            entry = ob_used["high"]
+            buffer_ = entry * OB_BUFFER_PCT
+            raw_dist = entry - ob_used["low"] + buffer_
+            min_dist = entry * MIN_SL_PCT
+            sl_dist_final = max(raw_dist, min_dist)
+            sl = entry - sl_dist_final
+            entry_basis = "edge_ob"
+        else:
+            # Fallback: tidak ada OB valid searah trade -> logika lama
+            # (nearest swing/pool + buffer 10% dari jarak).
+            sl_level = nearest_below(price)
+            if sl_level is None:
+                sl_level = price * 0.985
+            raw_dist = price - sl_level
+            min_dist = price * MIN_SL_PCT
+            dist = max(raw_dist, min_dist)
+            buffer_ = dist * 0.10
+            entry = price
+            sl = entry - dist - buffer_
+            sl_dist_final = entry - sl
+            entry_basis = "swing_fallback_no_ob"
+
+        # TP1/TP2/TP3 = pool/swing ke-1/2/3 terdekat searah trade dari ENTRY
+        # (logika liquidity-based lama, tidak berubah -- cuma basisnya
+        # sekarang `entry`, bukan `price`, karena entry bisa berbeda dari
+        # harga sekarang begitu basisnya Order Block).
+        cand_targets = targets_above(entry)
         min_gap = sl_dist_final * 0.3
 
         tp1 = (cand_targets[0] if len(cand_targets) >= 1
                and cand_targets[0] - entry >= min_gap
                else entry + sl_dist_final * 1.0)
-        # Fallback TP2/TP3 dihitung relatif terhadap R yang sudah dicapai TP1,
-        # bukan rr tetap -> supaya kalau TP1 (struktur asli) sudah jauh
-        # (misal 3R), TP2 tidak jatuh SEBELUM TP1 (yang bikin urutan kebalik).
         r1_reached = (tp1 - entry) / sl_dist_final if sl_dist_final > 0 else 1.0
         tp2 = (cand_targets[1] if len(cand_targets) >= 2
                and cand_targets[1] > tp1
@@ -956,25 +1225,36 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
         tp3 = (cand_targets[2] if len(cand_targets) >= 3
                and cand_targets[2] > tp2
                else entry + sl_dist_final * max(rr * 1.5, r2_reached + 1.0))
-        # Jaga-jaga terakhir supaya urutan tetap naik (TP1 < TP2 < TP3).
         tp2 = max(tp2, tp1 + sl_dist_final * 0.1)
         tp3 = max(tp3, tp2 + sl_dist_final * 0.1)
 
         risk = entry - sl
         order_type = "LIMIT/MARKET (struktur bullish)"
-    elif direction == "SHORT":
-        sl_level = nearest_above(price)
-        if sl_level is None:
-            sl_level = price * 1.015
-        raw_dist = sl_level - price
-        min_dist = price * MIN_SL_PCT
-        dist = max(raw_dist, min_dist)
-        buffer_ = dist * 0.10
-        entry = price
-        sl = entry + dist + buffer_
-        sl_dist_final = sl - entry
+        tier = classify_tier(risk, abs(tp1 - entry), abs(tp2 - entry))
+    else:  # SHORT
+        ob_used = pick_ob("SHORT")
+        if ob_used is not None:
+            entry = ob_used["low"]
+            buffer_ = entry * OB_BUFFER_PCT
+            raw_dist = ob_used["high"] - entry + buffer_
+            min_dist = entry * MIN_SL_PCT
+            sl_dist_final = max(raw_dist, min_dist)
+            sl = entry + sl_dist_final
+            entry_basis = "edge_ob"
+        else:
+            sl_level = nearest_above(price)
+            if sl_level is None:
+                sl_level = price * 1.015
+            raw_dist = sl_level - price
+            min_dist = price * MIN_SL_PCT
+            dist = max(raw_dist, min_dist)
+            buffer_ = dist * 0.10
+            entry = price
+            sl = entry + dist + buffer_
+            sl_dist_final = sl - entry
+            entry_basis = "swing_fallback_no_ob"
 
-        cand_targets = targets_below(price)
+        cand_targets = targets_below(entry)
         min_gap = sl_dist_final * 0.3
 
         tp1 = (cand_targets[0] if len(cand_targets) >= 1
@@ -993,15 +1273,12 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
 
         risk = sl - entry
         order_type = "LIMIT/MARKET (struktur bearish)"
-    else:
-        entry = price
-        sl = tp1 = tp2 = tp3 = price
-        risk = 0.0
-        order_type = None
+        tier = classify_tier(risk, abs(tp1 - entry), abs(tp2 - entry))
 
     return dict(direction=direction, entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
                 rr=rr, risk=risk, conf=conf, order_type=order_type, price_now=price,
-                poc=vp["poc"], vah=vp["vah"], val=vp["val"])
+                poc=vp["poc"], vah=vp["vah"], val=vp["val"],
+                entry_basis=entry_basis, order_block=ob_used, tier=tier)
 
 
 # =============================================================================
@@ -1139,9 +1416,21 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
         else:
             print(f"  ORDER TYPE  : {s['order_type']}  (perkiraan -- harga spot referensi "
                   "tidak tersedia, bandingkan manual dengan harga broker sebelum entry)")
-        print(f"  ENTRY       : {fmt(s['entry'])}   (dihitung dari harga proxy, "
-              "bisa selisih dari harga broker -- lihat Spot ref di atas)")
-        print(f"  STOP LOSS   : {fmt(s['sl'])}   (di luar liquidity pool/swing terdekat + buffer)")
+        basis_txt = {
+            "edge_ob": "edge Order Block (lihat detail OB di bawah)",
+            "swing_fallback_no_ob": "FALLBACK -- tidak ada Order Block valid searah trade, "
+                                     "pakai nearest swing/pool + buffer",
+        }.get(s.get("entry_basis"), "harga sekarang (proxy)")
+        print(f"  ENTRY       : {fmt(s['entry'])}   (basis: {basis_txt})")
+        print(f"  STOP LOSS   : {fmt(s['sl'])}   (edge OB berlawanan + buffer {OB_BUFFER_PCT*100:.2f}%, "
+              "atau fallback nearest swing/pool kalau tidak ada OB)")
+        if s.get("order_block"):
+            ob = s["order_block"]
+            print(f"   Order Block dipakai : {ob['type']} @ {fmt(ob['low'])}-{fmt(ob['high'])}")
+        if s.get("tier"):
+            tier_note = {"A": "layak penuh", "B": "layak marjinal (TP1 belum menutup risiko)",
+                         "C": "berisiko tinggi (risk > jarak TP2)"}.get(s["tier"], "")
+            print(f"  TIER        : {s['tier']}  ({tier_note})")
         if s["risk"] > 0:
             r1 = abs(s["tp1"] - s["entry"]) / s["risk"]
             r2 = abs(s["tp2"] - s["entry"]) / s["risk"]
@@ -1162,12 +1451,21 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
               f"-{NEUTRAL_THRESHOLD}..+{NEUTRAL_THRESHOLD}).")
     print("-" * 70)
 
-    print("  STRUKTUR & LIKUIDITAS")
+    src = a.get("structure_source", "native")
+    src_label = {
+        "twelvedata": "TwelveData (XAUUSD asli)",
+        "native": "data candle simbol ini sendiri",
+        "paxg_fallback_no_api_key": "FALLBACK PAXGUSDT (TwelveData API key belum di-set)",
+        "paxg_fallback_error": "FALLBACK PAXGUSDT (request TwelveData gagal)",
+        "paxg_fallback_insufficient_data": "FALLBACK PAXGUSDT (data TwelveData kurang)",
+    }.get(src, src)
+    print(f"  STRUKTUR & LIKUIDITAS   [sumber: {src_label}]")
     print(f"   Bias HTF     : {a['structure']['bias'].upper()} — {a['structure']['detail']}")
     if a["structure"]["bos"]:
         side, lvl = a["structure"]["bos"]
         print(f"   BOS terakhir : {side} menembus {fmt(lvl)}")
-    print(f"   POC / VAH / VAL : {fmt(a['vp']['poc'])} / {fmt(a['vp']['vah'])} / {fmt(a['vp']['val'])}")
+    vp_label = "  [skala harga: PAXGUSDT]" if asset_class == "xau" else ""
+    print(f"   POC / VAH / VAL : {fmt(a['vp']['poc'])} / {fmt(a['vp']['vah'])} / {fmt(a['vp']['val'])}{vp_label}")
     print(f"   VWAP{'  (sesi London-NY)' if asset_class=='xau' else ' (rolling)'} : {fmt(a['vwap'])}")
     if a.get("pools"):
         for p in select_relevant_pools(a["pools"], a["price"], max_n=4):
@@ -1282,7 +1580,9 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
     if asset_class == "crypto":
         a = analyze_crypto(df, bsym, has_futures)
     else:
-        a = analyze_xau(df, bsym, has_futures, dxy_bias_override=dxy_bias)
+        df_structure, structure_source = get_structure_df(asset_class, tf_label, df)
+        a = analyze_xau(df, bsym, has_futures, dxy_bias_override=dxy_bias,
+                         df_structure=df_structure, structure_source=structure_source)
 
     # "a['price']" dari analyze_crypto/xau = close candle H1/H4/dst yang SUDAH
     # closed (sengaja, biar struktur/VWAP/POC tidak goyang oleh candle yang
