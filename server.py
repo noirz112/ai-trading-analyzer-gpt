@@ -35,7 +35,7 @@ from fastapi.staticfiles import StaticFiles
 from engine import (
     resolve_symbol, parse_timeframe, fetch_klines, symbol_has_futures,
     analyze_crypto, analyze_xau, build_setup, fetch_spot_crosscheck,
-    fetch_cot_gold, print_report, plot_chart,
+    fetch_cot_gold, fetch_live_price, print_report, plot_chart,
 )
 
 app = FastAPI(
@@ -84,6 +84,19 @@ def analyze(
             a = analyze_crypto(df, bsym, has_futures)
         else:
             a = analyze_xau(df, bsym, has_futures, dxy_bias_override=dxy_bias)
+
+        # PENTING: server.py punya jalur eksekusi SENDIRI, terpisah dari
+        # run()/main() di engine.py (yang cuma dipakai CLI). Override harga
+        # live harus dipasang DI SINI juga, bukan cuma di run() -- kalau
+        # tidak, endpoint /analyze yang dipakai GPT tidak pernah dapat
+        # manfaatnya sama sekali (ini penyebab bug 'live price gagal terus').
+        live_price = fetch_live_price(bsym)
+        a["price_closed_candle"] = a["price"]
+        if live_price:
+            a["price"] = live_price
+            a["price_is_live"] = True
+        else:
+            a["price_is_live"] = False
 
         s = build_setup(a, rr=rr)
         spot_price, spot_label = fetch_spot_crosscheck(bsym)
