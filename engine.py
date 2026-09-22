@@ -1011,6 +1011,66 @@ def fmt(x, dp=4):
     return f"{x:.{dp}f}"
 
 
+def classify_order_type(direction: str, entry: float, ref_price, tol_pct: float = 0.0008):
+    """Tentukan tipe order (LIMIT/STOP/MARKET) dengan membandingkan level
+    ENTRY (dihitung dari harga proxy PAXGUSDT/gold-api) terhadap harga
+    referensi REAL (spot XAUUSD dari fetch_spot_crosscheck, yang jauh lebih
+    dekat ke harga broker seperti icMarkets daripada proxy).
+
+    Kenapa ini perlu: entry selalu dihitung dari `price` (proxy), yang bisa
+    selisih beberapa dollar dari harga broker user. Sebelumnya order_type
+    cuma teks generik "LIMIT/MARKET" -- tidak bilang entry itu pending
+    (nunggu harga menjemput) atau sudah bisa market. Sekarang dibandingkan
+    langsung ke spot_price supaya jelas.
+
+    Kalau spot_price tidak tersedia (None), kembalikan type=None -- caller
+    harus fallback ke label generik dan kasih catatan bahwa order type
+    belum bisa dipastikan tanpa harga referensi live.
+    """
+    if direction not in ("LONG", "SHORT") or not ref_price:
+        return {"type": None, "note": None}
+
+    diff = entry - ref_price
+    diff_pct = diff / ref_price if ref_price else 0.0
+
+    if abs(diff_pct) <= tol_pct:
+        return {
+            "type": "MARKET",
+            "note": (f"Entry ({fmt(entry)}) hampir sama dengan harga spot referensi "
+                     f"({fmt(ref_price)}) -> bisa dieksekusi market, tapi tetap cek "
+                     "ulang harga live di broker sebelum entry."),
+        }
+
+    if direction == "LONG":
+        if entry < ref_price:
+            return {
+                "type": "BUY LIMIT",
+                "note": (f"Entry ({fmt(entry)}) di BAWAH harga spot referensi "
+                         f"({fmt(ref_price)}) -> ini pending order, menunggu harga "
+                         "turun dulu ke level entry. BUKAN market order."),
+            }
+        return {
+            "type": "BUY STOP",
+            "note": (f"Entry ({fmt(entry)}) di ATAS harga spot referensi "
+                     f"({fmt(ref_price)}) -> ini pending order, menunggu harga "
+                     "tembus naik ke level entry dulu."),
+        }
+    else:  # SHORT
+        if entry > ref_price:
+            return {
+                "type": "SELL LIMIT",
+                "note": (f"Entry ({fmt(entry)}) di ATAS harga spot referensi "
+                         f"({fmt(ref_price)}) -> ini pending order, menunggu harga "
+                         "naik dulu ke level entry. BUKAN market order."),
+            }
+        return {
+            "type": "SELL STOP",
+            "note": (f"Entry ({fmt(entry)}) di BAWAH harga spot referensi "
+                     f"({fmt(ref_price)}) -> ini pending order, menunggu harga "
+                     "tembus turun ke level entry dulu."),
+        }
+
+
 def select_relevant_pools(pools, price, max_n=4):
     """
     Pilih liquidity pool yang PALING RELEVAN buat ditampilkan: selalu
@@ -1072,8 +1132,15 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
     print("-" * 70)
 
     if s["direction"] != "NEUTRAL":
-        print(f"  ORDER TYPE  : {s['order_type']}")
-        print(f"  ENTRY       : {fmt(s['entry'])}")
+        oc = classify_order_type(s["direction"], s["entry"], spot_price)
+        if oc["type"]:
+            print(f"  ORDER TYPE  : {oc['type']}")
+            print(f"  {'':12}  {oc['note']}")
+        else:
+            print(f"  ORDER TYPE  : {s['order_type']}  (perkiraan -- harga spot referensi "
+                  "tidak tersedia, bandingkan manual dengan harga broker sebelum entry)")
+        print(f"  ENTRY       : {fmt(s['entry'])}   (dihitung dari harga proxy, "
+              "bisa selisih dari harga broker -- lihat Spot ref di atas)")
         print(f"  STOP LOSS   : {fmt(s['sl'])}   (di luar liquidity pool/swing terdekat + buffer)")
         if s["risk"] > 0:
             r1 = abs(s["tp1"] - s["entry"]) / s["risk"]
