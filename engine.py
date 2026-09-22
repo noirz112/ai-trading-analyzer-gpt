@@ -861,34 +861,107 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
             cands += [s[2] for s in swing_h if s[2] > val]
         return min(cands) if cands else None
 
+    def targets_above(val, tol_ratio=0.0015):
+        """Semua level pool/swing di atas val, urut terdekat->terjauh,
+        level yang berhimpitan (<tol_ratio dari val) digabung jadi satu."""
+        cands = [p["price"] for p in pools if p["price"] > val]
+        if swing_h:
+            cands += [s[2] for s in swing_h if s[2] > val]
+        cands = sorted(set(cands))
+        merged = []
+        for c in cands:
+            if not merged or (c - merged[-1]) > val * tol_ratio:
+                merged.append(c)
+        return merged
+
+    def targets_below(val, tol_ratio=0.0015):
+        """Sama seperti targets_above tapi ke bawah, urut terdekat->terjauh."""
+        cands = [p["price"] for p in pools if p["price"] < val]
+        if swing_l:
+            cands += [s[2] for s in swing_l if s[2] < val]
+        cands = sorted(set(cands), reverse=True)
+        merged = []
+        for c in cands:
+            if not merged or (merged[-1] - c) > val * tol_ratio:
+                merged.append(c)
+        return merged
+
+    # Jarak SL akhir (dari entry) TIDAK BOLEH lebih kecil dari ini, apa pun
+    # posisi liquidity pool/swing terdekat. Sebelumnya floor ini cuma dipakai
+    # untuk menghitung besar buffer, bukan untuk menjamin jarak SL akhir -->
+    # itu penyebab SL bisa jadi cuma beberapa cent dari harga kalau struktur
+    # kebetulan sangat dekat. Sekarang floor ini yang menentukan jarak minimum.
+    MIN_SL_PCT = 0.001  # 0.1% dari harga; naikkan kalau masih terasa terlalu ketat
+
     if direction == "LONG":
         sl_level = nearest_below(price)
         if sl_level is None:
             sl_level = price * 0.985
-        sl_dist = max(price - sl_level, price * 0.001)
-        buffer_ = sl_dist * 0.10
+        raw_dist = price - sl_level
+        min_dist = price * MIN_SL_PCT
+        dist = max(raw_dist, min_dist)
+        buffer_ = dist * 0.10
         entry = price
-        sl = sl_level - buffer_
+        sl = entry - dist - buffer_
         sl_dist_final = entry - sl
-        target1 = nearest_above(price)
-        tp1 = target1 if target1 else entry + sl_dist_final * 1.0
-        tp2 = entry + sl_dist_final * rr
-        tp3 = entry + sl_dist_final * (rr * 1.5)
+
+        # TP1/TP2/TP3 = pool/swing ke-1/2/3 terdekat searah trade (LOGIC
+        # LIQUIDITY-BASED, konsisten dgn filosofi engine ini). Kalau struktur
+        # yang tersedia kurang dari 3 level, atau levelnya kurang jauh (belum
+        # 30% dari jarak SL -> terlalu dekat buat jadi target berarti), baru
+        # fallback ke kelipatan R (1R/2R/3R) seperti versi lama.
+        cand_targets = targets_above(price)
+        min_gap = sl_dist_final * 0.3
+
+        tp1 = (cand_targets[0] if len(cand_targets) >= 1
+               and cand_targets[0] - entry >= min_gap
+               else entry + sl_dist_final * 1.0)
+        # Fallback TP2/TP3 dihitung relatif terhadap R yang sudah dicapai TP1,
+        # bukan rr tetap -> supaya kalau TP1 (struktur asli) sudah jauh
+        # (misal 3R), TP2 tidak jatuh SEBELUM TP1 (yang bikin urutan kebalik).
+        r1_reached = (tp1 - entry) / sl_dist_final if sl_dist_final > 0 else 1.0
+        tp2 = (cand_targets[1] if len(cand_targets) >= 2
+               and cand_targets[1] > tp1
+               else entry + sl_dist_final * max(rr, r1_reached + 1.0))
+        r2_reached = (tp2 - entry) / sl_dist_final if sl_dist_final > 0 else 1.0
+        tp3 = (cand_targets[2] if len(cand_targets) >= 3
+               and cand_targets[2] > tp2
+               else entry + sl_dist_final * max(rr * 1.5, r2_reached + 1.0))
+        # Jaga-jaga terakhir supaya urutan tetap naik (TP1 < TP2 < TP3).
+        tp2 = max(tp2, tp1 + sl_dist_final * 0.1)
+        tp3 = max(tp3, tp2 + sl_dist_final * 0.1)
+
         risk = entry - sl
         order_type = "LIMIT/MARKET (struktur bullish)"
     elif direction == "SHORT":
         sl_level = nearest_above(price)
         if sl_level is None:
             sl_level = price * 1.015
-        sl_dist = max(sl_level - price, price * 0.001)
-        buffer_ = sl_dist * 0.10
+        raw_dist = sl_level - price
+        min_dist = price * MIN_SL_PCT
+        dist = max(raw_dist, min_dist)
+        buffer_ = dist * 0.10
         entry = price
-        sl = sl_level + buffer_
+        sl = entry + dist + buffer_
         sl_dist_final = sl - entry
-        target1 = nearest_below(price)
-        tp1 = target1 if target1 else entry - sl_dist_final * 1.0
-        tp2 = entry - sl_dist_final * rr
-        tp3 = entry - sl_dist_final * (rr * 1.5)
+
+        cand_targets = targets_below(price)
+        min_gap = sl_dist_final * 0.3
+
+        tp1 = (cand_targets[0] if len(cand_targets) >= 1
+               and entry - cand_targets[0] >= min_gap
+               else entry - sl_dist_final * 1.0)
+        r1_reached = (entry - tp1) / sl_dist_final if sl_dist_final > 0 else 1.0
+        tp2 = (cand_targets[1] if len(cand_targets) >= 2
+               and cand_targets[1] < tp1
+               else entry - sl_dist_final * max(rr, r1_reached + 1.0))
+        r2_reached = (entry - tp2) / sl_dist_final if sl_dist_final > 0 else 1.0
+        tp3 = (cand_targets[2] if len(cand_targets) >= 3
+               and cand_targets[2] < tp2
+               else entry - sl_dist_final * max(rr * 1.5, r2_reached + 1.0))
+        tp2 = min(tp2, tp1 - sl_dist_final * 0.1)
+        tp3 = min(tp3, tp2 - sl_dist_final * 0.1)
+
         risk = sl - entry
         order_type = "LIMIT/MARKET (struktur bearish)"
     else:
@@ -970,9 +1043,18 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
         print(f"  ORDER TYPE  : {s['order_type']}")
         print(f"  ENTRY       : {fmt(s['entry'])}")
         print(f"  STOP LOSS   : {fmt(s['sl'])}   (di luar liquidity pool/swing terdekat + buffer)")
-        print(f"  TP1         : {fmt(s['tp1'])}   (target: liquidity pool/swing berlawanan terdekat)")
-        print(f"  TP2 ({s['rr']}R)  : {fmt(s['tp2'])}")
-        print(f"  TP3 ({s['rr']*1.5:g}R) : {fmt(s['tp3'])}")
+        if s["risk"] > 0:
+            r1 = abs(s["tp1"] - s["entry"]) / s["risk"]
+            r2 = abs(s["tp2"] - s["entry"]) / s["risk"]
+            r3 = abs(s["tp3"] - s["entry"]) / s["risk"]
+        else:
+            r1 = r2 = r3 = 0.0
+        print(f"  TP1         : {fmt(s['tp1'])}   ({r1:.2f}R)")
+        print(f"  TP2         : {fmt(s['tp2'])}   ({r2:.2f}R)")
+        print(f"  TP3         : {fmt(s['tp3'])}   ({r3:.2f}R)")
+        print("  [TP1-3 diprioritaskan dari liquidity pool/swing terdekat searah trade,")
+        print("   urut dari yang paling dekat; kalau struktur di level segitu tidak")
+        print("   tersedia/terlalu dekat, dipakai proyeksi R-multiple sebagai gantinya]")
         if s["risk"] > 0:
             rr_actual = abs(s["tp2"] - s["entry"]) / s["risk"]
             print(f"  Risk:Reward : 1 : {rr_actual:.2f}")
