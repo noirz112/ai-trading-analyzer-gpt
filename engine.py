@@ -114,10 +114,13 @@ LIQUIDITY_TOL_PCT = 0.0015      # toleransi 0.15% untuk deteksi equal high/low
 FUNDING_EXTREME = 0.0005        # 0.05% dianggap funding "panas"
 
 # --- SOP Order Block (lihat dokumen SOP proyek) -----------------------------
-OB_IMPULSE_BODY_MULT = 1.2      # candle "impulsif" = body >= 1.2x rata-rata body 20 candle
-                                 # (diturunkan dari 1.5x pada 2026-09-22 setelah sampling live
-                                 # menunjukkan fallback rate 75% (3/4: XAUUSD M15, H4, BTCUSDT H1) --
-                                 # 1.5x terlalu ketat, OB jarang ketemu. Kalibrasi ulang kalau perlu.
+OB_IMPULSE_BODY_MULT = 1.5      # candle "impulsif" = body >= 1.5x rata-rata body 20 candle
+                                 # (2026-09-22: sempat diturunkan ke 1.2x, tapi itu dikalibrasi
+                                 # SAAT bos_idx masih bug (selalu = candle terakhir, bukan candle
+                                 # breakout asli) -- data kalibrasinya tidak valid. Dikembalikan ke
+                                 # 1.5x (nilai desain awal) supaya re-test dari kondisi bersih
+                                 # setelah bos_idx diperbaiki. Kalibrasi ulang kalau perlu, TAPI
+                                 # sampling ulang dulu -- jangan asumsikan hasil sampling lama.
 OB_BUFFER_PCT = 0.0005          # 0.05% dari harga entry, buffer DI LUAR edge OB
                                  # (starting parameter -- lihat SOP: rumus tetap "edge OB +
                                  # buffer", cuma angka ini yang boleh disetel ulang nanti)
@@ -456,18 +459,36 @@ def classify_structure(df: pd.DataFrame, swing_highs, swing_lows, n_last: int = 
 
     last_close = df["close"].iloc[-1]
     last_idx = len(df) - 1
+
+    def _first_break_idx(swing_idx: int, level: float, is_bullish: bool):
+        """Cari candle PERTAMA (bukan candle terakhir df) yang close-nya benar-benar
+        menembus level, dimulai tepat setelah swing itu terbentuk. Ini PENTING karena
+        find_order_blocks() mundur dari bos_idx untuk cari candle impulsif -- kalau
+        bos_idx selalu dipaksa ke candle terakhir (live 'now'), OB yang terdeteksi jadi
+        tidak konsisten dan tidak benar-benar terkait dengan breakout aslinya."""
+        for i in range(swing_idx + 1, last_idx + 1):
+            c = df["close"].iloc[i]
+            if (is_bullish and c > level) or (not is_bullish and c < level):
+                return i
+        return None
+
     if swing_highs:
-        last_swing_high = swing_highs[-1][2]
+        sh_idx, _, last_swing_high = swing_highs[-1]
         if last_close > last_swing_high:
-            result["bos"] = ("bullish", last_swing_high)
-            result["bos_idx"] = last_idx
+            bi = _first_break_idx(sh_idx, last_swing_high, True)
+            if bi is not None:
+                result["bos"] = ("bullish", last_swing_high)
+                result["bos_idx"] = bi
     if swing_lows:
-        last_swing_low = swing_lows[-1][2]
+        sl_idx, _, last_swing_low = swing_lows[-1]
         if last_close < last_swing_low:
-            # kalau dua-duanya break (jarang), yang paling baru menang -> cek index
-            if result["bos"] is None or swing_lows[-1][0] > swing_highs[-1][0]:
-                result["bos"] = ("bearish", last_swing_low)
-                result["bos_idx"] = last_idx
+            bi = _first_break_idx(sl_idx, last_swing_low, False)
+            if bi is not None:
+                # kalau dua-duanya break (jarang), yang index breakout-nya paling
+                # BARU yang menang (bukan sekadar swing index-nya)
+                if result["bos"] is None or bi >= result["bos_idx"]:
+                    result["bos"] = ("bearish", last_swing_low)
+                    result["bos_idx"] = bi
     return result
 
 
