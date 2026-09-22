@@ -141,6 +141,21 @@ def fetch_klines(symbol: str, interval: str = "4h", limit: int = 300) -> pd.Data
     return df
 
 
+def fetch_live_price(symbol: str):
+    """Harga real-time (bukan close candle terakhir yang sudah closed).
+    Dipakai sebagai 'harga sekarang' / basis Entry, terpisah dari klines yang
+    dipakai untuk struktur (VWAP/POC/pool/swing) -- supaya Entry tidak basi
+    sampai hampir 1 candle penuh saat candle timeframe besar (H4/D1) belum
+    tutup."""
+    try:
+        r = requests.get(f"{BINANCE_SPOT_KLINES.rsplit('/', 1)[0]}/ticker/price",
+                          params={"symbol": symbol.upper()}, timeout=8)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception:
+        return None
+
+
 def fetch_spot_crosscheck(binance_symbol: str):
     if binance_symbol not in SPOT_CHECK:
         return None, None
@@ -1032,7 +1047,10 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
              "NEUTRAL": "= NEUTRAL (belum ada setup jelas)"}[s["direction"]]
     print(f"  Arah        : {arrow}")
     print(f"  Confidence  : {s['conf']:.0f}%   (skor multi-faktor: {a['score']:+.0f})")
-    print(f"  Harga now   : {fmt(a['price'])}")
+    live_tag = "live" if a.get("price_is_live") else "close candle terakhir (live price gagal diambil)"
+    print(f"  Harga now   : {fmt(a['price'])}  ({live_tag})")
+    if a.get("price_closed_candle") is not None and a.get("price_is_live"):
+        print(f"  (Ref: close candle {tf_label} terakhir yang sudah closed = {fmt(a['price_closed_candle'])})")
     if spot_price is not None:
         spread = a["price"] - spot_price
         spread_pct = (spread / spot_price * 100) if spot_price else 0
@@ -1184,6 +1202,20 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
         a = analyze_crypto(df, bsym, has_futures)
     else:
         a = analyze_xau(df, bsym, has_futures, dxy_bias_override=dxy_bias)
+
+    # "a['price']" dari analyze_crypto/xau = close candle H1/H4/dst yang SUDAH
+    # closed (sengaja, biar struktur/VWAP/POC tidak goyang oleh candle yang
+    # masih berjalan). Tapi itu tidak cocok dipakai sebagai "harga sekarang"
+    # untuk Entry -> bisa basi sampai hampir 1 candle penuh. Override dengan
+    # harga live (ticker real-time) khusus untuk Entry/SL/TP; struktur tetap
+    # dari candle closed di atas.
+    live_price = fetch_live_price(bsym)
+    a["price_closed_candle"] = a["price"]
+    if live_price:
+        a["price"] = live_price
+        a["price_is_live"] = True
+    else:
+        a["price_is_live"] = False
 
     s = build_setup(a, rr=rr)
     spot_price, spot_label = fetch_spot_crosscheck(bsym)
