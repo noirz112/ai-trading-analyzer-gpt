@@ -114,8 +114,10 @@ LIQUIDITY_TOL_PCT = 0.0015      # toleransi 0.15% untuk deteksi equal high/low
 FUNDING_EXTREME = 0.0005        # 0.05% dianggap funding "panas"
 
 # --- SOP Order Block (lihat dokumen SOP proyek) -----------------------------
-OB_IMPULSE_BODY_MULT = 1.5      # candle "impulsif" = body >= 1.5x rata-rata body 20 candle
-                                 # sebelumnya (starting parameter, boleh dikalibrasi ulang)
+OB_IMPULSE_BODY_MULT = 1.2      # candle "impulsif" = body >= 1.2x rata-rata body 20 candle
+                                 # (diturunkan dari 1.5x pada 2026-09-22 setelah sampling live
+                                 # menunjukkan fallback rate 75% (3/4: XAUUSD M15, H4, BTCUSDT H1) --
+                                 # 1.5x terlalu ketat, OB jarang ketemu. Kalibrasi ulang kalau perlu.
 OB_BUFFER_PCT = 0.0005          # 0.05% dari harga entry, buffer DI LUAR edge OB
                                  # (starting parameter -- lihat SOP: rumus tetap "edge OB +
                                  # buffer", cuma angka ini yang boleh disetel ulang nanti)
