@@ -40,7 +40,7 @@ from engine import (
     resolve_symbol, parse_timeframe, fetch_klines, symbol_has_futures,
     analyze_crypto, analyze_xau, build_setup, fetch_spot_crosscheck,
     fetch_cot_gold, fetch_live_price, print_report, plot_chart,
-    classify_order_type, get_structure_df,
+    classify_order_type, get_structure_df, evaluate_tradeable,
 )
 
 app = FastAPI(
@@ -121,6 +121,12 @@ def analyze(
         # (BUY/SELL LIMIT vs STOP vs MARKET) dengan membandingkan entry ke
         # spot_price -- bukan sekadar label generik "LIMIT/MARKET".
         order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
+
+        # Filter konservatif tambahan (lihat evaluate_tradeable() di engine.py):
+        # tradeable=True HANYA kalau tier A DAN struktur HTF tidak ranging.
+        # TIDAK menyembunyikan setup Tier B/C -- laporan tetap tampil penuh,
+        # ini cuma flag rekomendasi ekstra buat GPT/user memutuskan.
+        tradeable_eval = evaluate_tradeable(a, s)
         spot_spread = None
         spot_spread_pct = None
         if spot_price:
@@ -169,6 +175,8 @@ def analyze(
                 "type": ob["type"], "low": ob["low"], "high": ob["high"],
             } if ob else None),
             "tier": s.get("tier"),
+            "tradeable": tradeable_eval["tradeable"],
+            "tradeable_reason": tradeable_eval["reason"],
             "sl": s["sl"],
             "tp1": s["tp1"],
             "tp2": s["tp2"],
