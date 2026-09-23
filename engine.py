@@ -1540,25 +1540,30 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
 
 def evaluate_tradeable(a: dict, s: dict, order_type: str = None) -> dict:
     """
-    Filter KONSERVATIF tambahan -- TIDAK menghapus atau menyembunyikan setup
-    apa pun dari laporan (SOP: semua tier tetap ditampilkan apa adanya).
-    tradeable=True kalau tier A DAN SALAH SATU dari dua jalur berikut:
+    Filter KONSERVATIF -- TIDAK menghapus/menyembunyikan setup apa pun dari
+    laporan (SOP: semua tier tetap ditampilkan apa adanya). tradeable=True
+    HANYA lewat SATU jalur: "fresh_ob_pending" -- Tier A DAN entry dari
+    Order Block asli (bukan fallback swing/pool) DAN order type LIMIT
+    (BUY LIMIT/SELL LIMIT, pending -- tidak mengejar harga sekarang).
 
-      Jalur "confirmed": structure.bias sudah bullish/bearish (3 swing
-      high & 3 swing low terakhir bersih searah) -- aman tapi telat,
-      entry (OB) biasanya sudah lama terjadi & harga sudah bergerak jauh.
+    KENAPA "bias HTF sudah confirmed" (3 swing bersih searah) TIDAK LAGI
+    dipakai sebagai syarat tradeable=True, walau dulu jadi jalur utama:
+    Backtest walk-forward 2026-09-23 (backtest_engine.py) di XAUUSD, TIGA
+    timeframe independen (M15/30hr, H1/180hr, H4/365hr), win rate ke TP1:
+        baseline tanpa filter : 56-62%
+        bias "confirmed"      : 56-63%  <- NYARIS SAMA DENGAN BASELINE
+        fresh_ob_pending      : 90-97%  <- jauh di atas keduanya, konsisten
+    Jadi syarat "confirmed" TIDAK terbukti memberi edge nyata dibanding
+    tanpa filter sama sekali (selisih cuma noise statistik), sedangkan
+    fresh_ob_pending konsisten unggul besar di ketiga timeframe. Karena
+    itu jalur "confirmed" diturunkan jadi INFORMASI SAJA (tetap dilaporkan
+    di 'reason' untuk transparansi bias HTF), bukan lagi penentu tradeable.
 
-      Jalur "fresh_ob_pending": entry_basis == "edge_ob" (Order Block asli
-      dari BOS, BUKAN fallback swing/pool) DAN order_type LIMIT (BUY LIMIT/
-      SELL LIMIT). Order LIMIT tidak "mengejar" harga sekarang -- dia
-      menunggu re-test level OB, jadi syarat bias 3-swing yang sudah
-      established tidak wajib berlaku di sini: yang penting levelnya
-      structural (dari BOS asli), bukan fallback, dan eksekusinya nanti
-      saat harga kembali ke level itu, bukan sekarang.
-
-    Kalau order_type MARKET/STOP (mengejar harga sekarang), jalur kedua ini
-    TIDAK berlaku -- tetap wajib lewat jalur "confirmed" saja, karena tidak
-    ada buffer waktu re-test yang melindungi dari struktur yang belum jelas.
+    CATATAN: ini kesimpulan dari backtest pakai struktur proxy PAXGUSDT,
+    1 symbol (XAUUSD), rentang waktu tertentu -- bukan jaminan berlaku
+    selamanya/di semua kondisi. Kalau pola market berubah drastis atau
+    backtest di symbol/periode lain menunjukkan hasil berbeda, kalibrasi
+    ulang fungsi ini.
     """
     if s.get("direction") == "NEUTRAL":
         return {"tradeable": False, "path": None,
@@ -1571,30 +1576,27 @@ def evaluate_tradeable(a: dict, s: dict, order_type: str = None) -> dict:
     has_fresh_ob = s.get("entry_basis") == "edge_ob" and s.get("order_block") is not None
     is_pending_limit = order_type in ("BUY LIMIT", "SELL LIMIT")
 
-    path_confirmed = tier_ok and bias_confirmed
-    path_fresh_pending = tier_ok and has_fresh_ob and is_pending_limit
+    if not tier_ok:
+        return {"tradeable": False, "path": None,
+                "reason": f"Tier {s.get('tier')} (bukan A) -- risk belum tertutup penuh oleh TP1."}
+
+    if has_fresh_ob and is_pending_limit:
+        bias_note = (f"struktur HTF '{bias}' sudah confirmed juga (bonus konteks)"
+                      if bias_confirmed else
+                      f"struktur HTF '{bias}' belum confirmed, tapi terbukti tidak signifikan di backtest")
+        return {"tradeable": True, "path": "fresh_ob_pending",
+                "reason": f"Tier A, entry dari Order Block asli (BOS), order {order_type} "
+                           f"(pending, tidak mengejar harga) -- {bias_note}."}
 
     reasons = []
-    if not tier_ok:
-        reasons.append(f"Tier {s.get('tier')} (bukan A) -- risk belum tertutup penuh oleh TP1.")
-        return {"tradeable": False, "path": None, "reason": "; ".join(reasons)}
-
-    if path_confirmed:
-        reasons.append("Tier A dan struktur HTF searah trade (bias sudah confirmed, bukan ranging).")
-        return {"tradeable": True, "path": "confirmed", "reason": "; ".join(reasons)}
-
-    if path_fresh_pending:
-        reasons.append(f"Tier A, entry dari Order Block asli (BOS), order {order_type} (pending, "
-                        f"tidak mengejar harga) -- struktur HTF '{bias}' belum confirmed penuh, "
-                        f"tapi entry menunggu re-test level, bukan eksekusi sekarang.")
-        return {"tradeable": True, "path": "fresh_ob_pending", "reason": "; ".join(reasons)}
-
-    if not bias_confirmed:
-        reasons.append(f"Struktur HTF '{bias}' (belum confirmed / bukan fresh-OB-pending yang valid).")
     if not has_fresh_ob:
         reasons.append("Entry bukan dari Order Block asli (fallback swing/liquidity pool).")
     if not is_pending_limit:
         reasons.append(f"Order type '{order_type}' bukan LIMIT pending (mengejar harga sekarang).")
+    reasons.append(f"[info] Bias HTF '{bias}' "
+                    f"({'sudah confirmed' if bias_confirmed else 'belum confirmed/ranging'}) -- "
+                    f"TIDAK dipakai lagi sebagai penentu tradeable (backtest: tidak terbukti unggul "
+                    f"dari baseline).")
     return {"tradeable": False, "path": None, "reason": "; ".join(reasons)}
 
 
@@ -1933,9 +1935,7 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
     order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
     resolved_order_type = order_type_detail["type"] or s["order_type"]
     tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type)
-    tag = {"confirmed": "LAYAK (struktur HTF sudah confirmed)",
-           "fresh_ob_pending": "LAYAK (OB asli + LIMIT pending, tidak mengejar harga)",
-           None: "MARJINAL/SKIP"}[tradeable_eval["path"]]
+    tag = "LAYAK (OB asli + LIMIT pending, tidak mengejar harga)" if tradeable_eval["tradeable"] else "MARJINAL/SKIP"
     print(f"  [FILTER KONSERVATIF] {tag} -- {tradeable_eval['reason']}\n")
 
     if chart:
