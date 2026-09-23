@@ -52,6 +52,12 @@ app = FastAPI(
     ],
 )
 
+# Default mode server. Set env ONLY_TRADEABLE_DEFAULT=true di Railway supaya SEMUA
+# panggilan /analyze (termasuk dari Custom GPT yang belum tahu parameter
+# only_tradeable) hanya mengembalikan setup kalau Tier A + tradeable=True.
+# Tidak di-set / false = perilaku lama (semua tier tampil).
+ONLY_TRADEABLE_DEFAULT = os.environ.get("ONLY_TRADEABLE_DEFAULT", "false").strip().lower() in ("1", "true", "yes", "on")
+
 CHART_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charts")
 os.makedirs(CHART_DIR, exist_ok=True)
 app.mount("/charts", StaticFiles(directory=CHART_DIR), name="charts")
@@ -70,7 +76,13 @@ def analyze(
     chart: bool = Query(False, description="Simpan & kembalikan chart PNG"),
     cot: bool = Query(False, description="Sertakan COT Gold (khusus XAU)"),
     dxy_bias: str = Query(None, description="bullish/bearish/neutral (khusus XAU, opsional)"),
+    only_tradeable: bool = Query(None, description="Kalau true: hanya kembalikan setup jika "
+                                 "Tier A DAN tradeable=True; kalau tidak, kembalikan alasan tanpa entry/SL/TP. "
+                                 "Kosong = ikut default server (env ONLY_TRADEABLE_DEFAULT)."),
 ):
+    if only_tradeable is None:
+        only_tradeable = ONLY_TRADEABLE_DEFAULT
+
     if not symbol or not interval:
         return JSONResponse(
             status_code=400,
@@ -127,7 +139,21 @@ def analyze(
         # tradeable=True lewat jalur "confirmed" (bias mapan) ATAU jalur
         # "fresh_ob_pending" (OB asli + order LIMIT, tidak mengejar harga).
         # TIDAK menyembunyikan setup Tier B/C -- laporan tetap tampil penuh.
-        tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type)
+        tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type,
+                                           asset_class=asset_class, tf_label=tf_label)
+        if only_tradeable and not tradeable_eval["tradeable"]:
+            return {
+                "symbol": display,
+                "interval": tf_label,
+                "tradeable": False,
+                "tier": s.get("tier"),
+                "setup_available": False,
+                "tradeable_reason": tradeable_eval["reason"],
+                "message": "Tidak ada setup yang memenuhi syarat (wajib Tier A + tradeable=True) "
+                           "saat ini. Entry/SL/TP sengaja tidak dikembalikan.",
+                "instruction_for_assistant": "Sampaikan bahwa belum ada setup yang memenuhi syarat beserta "
+                                             "tradeable_reason. JANGAN membuat atau menebak entry/SL/TP sendiri.",
+            }
         spot_spread = None
         spot_spread_pct = None
         if spot_price:
@@ -144,13 +170,15 @@ def analyze(
         chart_url = None
         if chart:
             try:
-                fname = f"chart_{display}_{tf_label}_v2.png"
-                cwd = os.getcwd()
-                os.chdir(CHART_DIR)
-                try:
-                    plot_chart(display, bsym, tf_label, df, a, s)
-                finally:
-                    os.chdir(cwd)
+                # TIDAK pakai os.chdir(): itu mengubah cwd milik SELURUH
+                # proses (bukan per-thread), jadi request /analyze?chart=true
+                # yang datang bersamaan (FastAPI menjalankan endpoint sync di
+                # threadpool) bisa saling menimpa cwd satu sama lain dan
+                # menyimpan PNG di direktori yang salah -> chart_url 404.
+                # plot_chart() sekarang terima out_dir eksplisit dan
+                # menyimpan langsung ke situ, aman untuk concurrency.
+                fpath = plot_chart(display, bsym, tf_label, df, a, s, out_dir=CHART_DIR)
+                fname = os.path.basename(fpath)
                 chart_url = f"/charts/{fname}"
             except Exception as e:
                 report_text += f"\n[chart gagal: {e}]"
