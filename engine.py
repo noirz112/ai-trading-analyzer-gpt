@@ -1166,6 +1166,14 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
     """
     price = float(df["close"].iloc[-1])
     struct_df = df_structure if df_structure is not None else df
+    # Harga penutupan terakhir DALAM SKALA struct_df (sama dengan skala semua
+    # level OB/pool/swing di bawah). Kalau struct_df == df (native/fallback),
+    # ini identik dengan `price` (offset = 0). Kalau struct_df = TwelveData
+    # XAUUSD asli sementara df = proxy PAXGUSDT, dua angka ini BISA beda
+    # $1-5 -- build_setup() WAJIB pakai struct_price ini (bukan `price`)
+    # untuk membandingkan/memilih level yang berasal dari struct_df, supaya
+    # tidak salah pilih OB atau salah hitung jarak SL akibat skala campur.
+    struct_price = float(struct_df["close"].iloc[-1])
     swing_h, swing_l = find_swings(struct_df, left=3, right=3)
     structure = classify_structure(struct_df, swing_h, swing_l)
     pools = find_liquidity_pools(swing_h, swing_l)
@@ -1336,7 +1344,7 @@ def analyze_xau(df: pd.DataFrame, symbol: str, has_futures: bool, dxy_bias_overr
                         f"(cuma 1 faktor, bukan data posisi riil XAUUSD, tidak menambah skor)")
 
     return dict(
-        score=score, reasons=reasons, price=price,
+        score=score, reasons=reasons, price=price, struct_price=struct_price,
         structure=structure, pools=pools, vp=vp, vwap=vwap_val,
         reaction=reaction, vol_ratio=vol_ratio, dxy=dxy_info,
         dxy_override=dxy_bias_override, funding=funding, oi=oi, magnet=magnet,
@@ -1360,6 +1368,16 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
     swing_h, swing_l = a["swing_h"], a["swing_l"]
     order_blocks = a.get("order_blocks", [])
 
+    # struct_price = harga dalam skala yang SAMA dengan pools/swing_h/swing_l/
+    # order_blocks (lihat analyze_xau). Untuk asset_class crypto (analyze_crypto)
+    # field ini tidak ada -> fallback ke price, offset = 0, perilaku tidak
+    # berubah. scale_offset dipakai HANYA di jalur fallback (swing_fallback_
+    # no_ob) untuk menggeser level struct-scale ke skala `price` sebelum
+    # dipakai menghitung jarak SL dari entry=price -- lihat komentar di
+    # pick_ob()/fallback branch di bawah untuk kenapa ini perlu.
+    struct_price = a.get("struct_price", price)
+    scale_offset = price - struct_price
+
     SCORE_MAX = 100.0
     conf = 50.0 + 40.0 * min(1.0, abs(a["score"]) / SCORE_MAX)
 
@@ -1382,27 +1400,41 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
             cands += [s[2] for s in swing_h if s[2] > val]
         return min(cands) if cands else None
 
-    def targets_above(val, tol_ratio=0.0015):
+    def targets_above(val, tol_ratio=0.0015, ref_offset=0.0):
         """Semua level pool/swing di atas val, urut terdekat->terjauh,
-        level yang berhimpitan (<tol_ratio dari val) digabung jadi satu."""
-        cands = [p["price"] for p in pools if p["price"] > val]
+        level yang berhimpitan (<tol_ratio dari val) digabung jadi satu.
+
+        ref_offset (fix price-scale mismatch): pools/swing_h ada dalam skala
+        struct_price, sementara `val` (entry) bisa dalam skala `price` proxy
+        kalau dipanggil dari jalur fallback (swing_fallback_no_ob). ref_offset
+        = price - struct_price mengonversi val ke skala struct SEBELUM
+        difilter, lalu hasilnya digeser balik ke skala val supaya konsisten
+        dengan entry yang dipakai caller. Default 0.0 = tidak ada konversi
+        (dipakai saat val sudah dalam skala struct, mis. entry dari edge OB).
+        """
+        struct_val = val - ref_offset
+        cands = [p["price"] for p in pools if p["price"] > struct_val]
         if swing_h:
-            cands += [s[2] for s in swing_h if s[2] > val]
+            cands += [s[2] for s in swing_h if s[2] > struct_val]
         cands = sorted(set(cands))
         merged = []
         for c in cands:
+            c = c + ref_offset
             if not merged or (c - merged[-1]) > val * tol_ratio:
                 merged.append(c)
         return merged
 
-    def targets_below(val, tol_ratio=0.0015):
-        """Sama seperti targets_above tapi ke bawah, urut terdekat->terjauh."""
-        cands = [p["price"] for p in pools if p["price"] < val]
+    def targets_below(val, tol_ratio=0.0015, ref_offset=0.0):
+        """Sama seperti targets_above tapi ke bawah, urut terdekat->terjauh.
+        Lihat catatan ref_offset di targets_above()."""
+        struct_val = val - ref_offset
+        cands = [p["price"] for p in pools if p["price"] < struct_val]
         if swing_l:
-            cands += [s[2] for s in swing_l if s[2] < val]
+            cands += [s[2] for s in swing_l if s[2] < struct_val]
         cands = sorted(set(cands), reverse=True)
         merged = []
         for c in cands:
+            c = c + ref_offset
             if not merged or (merged[-1] - c) > val * tol_ratio:
                 merged.append(c)
         return merged
@@ -1418,16 +1450,25 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
         BAWAH harga, karena impuls yang memicu BOS sudah membawa harga naik
         menjauhinya) -> pilih yang high-nya paling tinggi (paling dekat ke
         harga). Untuk SHORT: simetris terbalik.
+
+        PENTING (fix price-scale mismatch): perbandingan di bawah memakai
+        `struct_price`, BUKAN `price`. order_blocks berasal dari struct_df
+        (bisa XAUUSD asli/TwelveData), sedangkan `price` ada di skala proxy
+        PAXGUSDT/live. Membandingkan o["high"]/o["low"] (skala struct_df)
+        terhadap `price` (skala proxy) bisa salah menerima/menolak OB kalau
+        dua skala itu selisih beberapa dollar -- entry/SL yang dihasilkan
+        (ob_used["high"]/["low"]) TETAP dalam skala struct_df aslinya, jadi
+        tidak perlu dikonversi lagi setelah OB terpilih benar.
         """
         want_type = "bullish" if dir_ == "LONG" else "bearish"
         cands = [o for o in order_blocks if o["type"] == want_type and not o.get("mitigated", False)]
         if not cands:
             return None
         if dir_ == "LONG":
-            cands = [o for o in cands if o["high"] <= price]
+            cands = [o for o in cands if o["high"] <= struct_price]
             return max(cands, key=lambda o: o["high"]) if cands else None
         else:
-            cands = [o for o in cands if o["low"] >= price]
+            cands = [o for o in cands if o["low"] >= struct_price]
             return min(cands, key=lambda o: o["low"]) if cands else None
 
     if direction == "NEUTRAL":
@@ -1452,9 +1493,16 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
         else:
             # Fallback: tidak ada OB valid searah trade -> logika lama
             # (nearest swing/pool + buffer 10% dari jarak).
-            sl_level = nearest_below(price)
+            # Fix price-scale mismatch: pilih level dalam skala struct_price
+            # (skala yang sama dengan pools/swing_l), lalu geser balik ke
+            # skala `price` (+scale_offset) sebelum dipakai hitung jarak dari
+            # entry=price -- kalau tidak, raw_dist bisa keliru sebesar selisih
+            # skala proxy vs struktur asli (bisa $1-5 di XAUUSD).
+            sl_level = nearest_below(struct_price)
             if sl_level is None:
                 sl_level = price * 0.985
+            else:
+                sl_level = sl_level + scale_offset
             raw_dist = price - sl_level
             min_dist = price * MIN_SL_PCT
             dist = max(raw_dist, min_dist)
@@ -1468,7 +1516,10 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
         # (logika liquidity-based lama, tidak berubah -- cuma basisnya
         # sekarang `entry`, bukan `price`, karena entry bisa berbeda dari
         # harga sekarang begitu basisnya Order Block).
-        cand_targets = targets_above(entry)
+        # ref_offset=0 di jalur edge_ob (entry sudah skala struct); di jalur
+        # fallback entry=price (skala proxy) -> perlu scale_offset supaya
+        # target pool/swing (skala struct) dibandingkan & dikembalikan benar.
+        cand_targets = targets_above(entry, ref_offset=(0.0 if entry_basis == "edge_ob" else scale_offset))
         min_gap = sl_dist_final * 0.3
 
         tp1 = (cand_targets[0] if len(cand_targets) >= 1
@@ -1499,9 +1550,13 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
             sl = entry + sl_dist_final
             entry_basis = "edge_ob"
         else:
-            sl_level = nearest_above(price)
+            # Sama seperti fallback LONG di atas -- pilih di skala struct_price,
+            # geser balik ke skala `price` sebelum dipakai hitung jarak.
+            sl_level = nearest_above(struct_price)
             if sl_level is None:
                 sl_level = price * 1.015
+            else:
+                sl_level = sl_level + scale_offset
             raw_dist = sl_level - price
             min_dist = price * MIN_SL_PCT
             dist = max(raw_dist, min_dist)
@@ -1511,7 +1566,7 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
             sl_dist_final = sl - entry
             entry_basis = "swing_fallback_no_ob"
 
-        cand_targets = targets_below(entry)
+        cand_targets = targets_below(entry, ref_offset=(0.0 if entry_basis == "edge_ob" else scale_offset))
         min_gap = sl_dist_final * 0.3
 
         tp1 = (cand_targets[0] if len(cand_targets) >= 1
@@ -1538,7 +1593,18 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
                 entry_basis=entry_basis, order_block=ob_used, tier=tier)
 
 
-def evaluate_tradeable(a: dict, s: dict, order_type: str = None) -> dict:
+# Kombinasi (asset_class, timeframe) yang SUDAH punya bukti EV negatif dari
+# sampel besar -> tradeable dipaksa False (laporan tetap menampilkan setup).
+# Sumber: backtest_multi.py 2026-09-24, XAUUSD proxy PAXGUSDT, H1 125 hari,
+# 165 trade selesai, win rate 40.0%, expectancy -0.08R. Tinjau ulang hanya
+# setelah re-test dengan n_decided dan rentang data yang tercatat.
+TRADEABLE_BLOCKLIST = {
+    ("xau", "H1"): "backtest 2026-09-24: 165 trade H1, win rate 40.0%, expectancy -0.08R (negatif)",
+}
+
+
+def evaluate_tradeable(a: dict, s: dict, order_type: str = None,
+                       asset_class: str = None, tf_label: str = None) -> dict:
     """
     Filter KONSERVATIF -- TIDAK menghapus/menyembunyikan setup apa pun dari
     laporan (SOP: semua tier tetap ditampilkan apa adanya). tradeable=True
@@ -1547,27 +1613,121 @@ def evaluate_tradeable(a: dict, s: dict, order_type: str = None) -> dict:
     (BUY LIMIT/SELL LIMIT, pending -- tidak mengejar harga sekarang).
 
     KENAPA "bias HTF sudah confirmed" (3 swing bersih searah) TIDAK LAGI
-    dipakai sebagai syarat tradeable=True, walau dulu jadi jalur utama:
-    Backtest walk-forward 2026-09-23 (backtest_engine.py) di XAUUSD, TIGA
-    timeframe independen (M15/30hr, H1/180hr, H4/365hr), win rate ke TP1:
-        baseline tanpa filter : 56-62%
-        bias "confirmed"      : 56-63%  <- NYARIS SAMA DENGAN BASELINE
-        fresh_ob_pending      : 90-97%  <- jauh di atas keduanya, konsisten
-    Jadi syarat "confirmed" TIDAK terbukti memberi edge nyata dibanding
-    tanpa filter sama sekali (selisih cuma noise statistik), sedangkan
-    fresh_ob_pending konsisten unggul besar di ketiga timeframe. Karena
-    itu jalur "confirmed" diturunkan jadi INFORMASI SAJA (tetap dilaporkan
-    di 'reason' untuk transparansi bias HTF), bukan lagi penentu tradeable.
+    dipakai sebagai syarat tradeable=True SENDIRIAN, walau dulu jadi jalur
+    utama: dari SEMUA backtest sejauh ini (termasuk yang di bawah), bias
+    "confirmed" konsisten nyaris sama dengan baseline tanpa filter -- tidak
+    terbukti memberi edge tambahan. Itu bagian yang masih valid.
 
-    CATATAN: ini kesimpulan dari backtest pakai struktur proxy PAXGUSDT,
-    1 symbol (XAUUSD), rentang waktu tertentu -- bukan jaminan berlaku
-    selamanya/di semua kondisi. Kalau pola market berubah drastis atau
-    backtest di symbol/periode lain menunjukkan hasil berbeda, kalibrasi
-    ulang fungsi ini.
+    [KOREKSI 2026-09-24] Klaim lama di sini ("fresh_ob_pending win rate
+    90-97% di XAUUSD, tiga timeframe") DICABUT -- TIDAK terbukti reproduce
+    dan sudah TERBANTAHKAN oleh backtest dengan sampel jauh lebih besar:
+
+        backtest_multi.py, 2026-09-24, XAUUSD (proxy PAXGUSDT),
+        jalur TRADEABLE_TRUE ("fresh_ob_pending"):
+            M15 (41 hari, ~4000 candle) : win rate 69.8%  (159 trade selesai)
+            H1  (125 hari, ~3000 candle): win rate 40.0%  (165 trade selesai,
+                                          expectancy NEGATIF -0.08R)
+            H4  (333 hari, ~2000 candle): win rate 48.1%  (77 trade selesai)
+        Kandidat TERBAIK di run itu (n>=15 trade, semua 6 kombinasi symbol x
+        timeframe yang diuji) justru BTCUSDT H4 (+0.73R, win rate 61.9%),
+        BUKAN XAUUSD sama sekali.
+
+    Klaim 90-97% yang lama kemungkinan besar tidak valid karena salah satu
+    atau kombinasi dari: (a) dihitung dari sampel yang jauh lebih kecil
+    (rentang waktu tidak sejelas run 2026-09-24 di atas), dan/atau (b) state
+    kode saat itu belum bersih -- lihat riwayat OB_IMPULSE_BODY_MULT di atas
+    modul ini: parameter itu sempat dikalibrasi SAAT bos_idx masih bug
+    (selalu = candle terakhir, bukan candle breakout asli), jadi backtest
+    yang jalan di sekitar tanggal itu tidak otomatis bisa dipercaya tanpa
+    tahu persis versi kode & jumlah trade di baliknya. Log/command asli yang
+    menghasilkan klaim 90-97% itu TIDAK tersedia lagi untuk ditelusuri ulang.
+
+    [UPDATE 2026-09-24 -- RUN ULANG, RENTANG LEBIH PANJANG] jalur TRADEABLE_TRUE
+    ("fresh_ob_pending"), struktur proxy PAXGUSDT utk XAUUSD. Command:
+        python -X utf8 backtest_multi.py --xau-tf M15 --btc-tf H4 --limit 9000 --step 3 --out-dir results_run2_m15
+        python -X utf8 backtest_multi.py --xau-tf H4 --btc-tf H4 --limit 3000 --out-dir results_run2_h4
+    Hasil (n = trade SELESAI, rr=2.0, warmup 200, SL duluan kalau ambigu):
+        XAUUSD M15 : 2026-06-22..2026-09-23 (~94 hari, step 3) -> win 60.4%, +0.29R, n=106
+        XAUUSD H4  : 2025-05-11..2026-09-23 (step 1)           -> win 48.2%, +0.35R, n=137
+        BTCUSDT H4 : 2022-08-15..2026-09-23 (step 3)           -> win 63.9%, +0.68R, n=133
+        BTCUSDT H4 : 2025-05-11..2026-09-23 (step 1)           -> win 61.2%, +0.66R, n=165
+    Pembanding tanpa filter (BASELINE): XAUUSD M15 +0.10R, XAUUSD H4 -0.10R,
+    BTCUSDT H4 -0.13R (2022-2026) / +0.01R (2025-2026).
+
+    KESIMPULAN SEMENTARA (2026-09-24): jalur "fresh_ob_pending" punya expectancy
+    positif konsisten di BTCUSDT H4 (3 run terpisah, +0.66R..+0.73R), dan run
+    ulang juga positif di XAUUSD H4 (+0.35R, win rate 48.2% sama dgn run
+    sebelumnya) dan XAUUSD M15 (+0.29R, turun dari win 69.8% di sampel 41 hari
+    -> 60.4% di 94 hari, wajar utk regresi ke rata-rata). XAUUSD H1 tetap
+    DIBLOKIR (TRADEABLE_BLOCKLIST) krn -0.08R dari 165 trade -- CATATAN: H1
+    baru diuji SEKALI (125 hari), belum diulang di rentang lebih panjang.
+    [ANALISIS TRADE LOG 2026-09-24, trades_*_H4.csv, 2025-05..2026-09, step 1]
+    Trade yang selesai ternyata banyak DUPLIKAT dari setup yg sama (kunci =
+    arah+entry+SL): BTCUSDT H4 165 trade = hanya 51 setup unik -> win 58.8%,
+    +0.56R, bootstrap 95% CI [+0.16, +0.98]. XAUUSD H4 137 trade = hanya 45
+    setup unik -> win 46.7%, +0.16R, 95% CI [-0.22, +0.55] (TIDAK bisa
+    dibedakan dari nol). Ada juga kuartal negatif: BTC 2026Q3 -0.35R, XAU
+    2026Q1 -0.67R; hasil BTC sangat ditopang 2025Q4 (+1.91R). 43% (BTC) dan
+    61% (XAU) sinyal tradeable tidak pernah selesai (FILL_TIMEOUT).
+    XAUUSD M15 (trades_XAUUSD_M15.csv, 2026-06-24..2026-09-23, step 3): 106
+    trade = 77 setup unik -> win 58.4%, +0.25R, 95% CI [+0.01, +0.49]
+    (batas bawah nyaris nol). Expectancy per bulan menurun: Jul +0.45R,
+    Ags +0.30R, Sep +0.05R. 66% sinyal tradeable FILL_TIMEOUT. Median jarak
+    SL hanya ~$7.8 (spread/slippage broker memakan porsi R yg berarti).
+    => EVIDENCE: BTCUSDT H4 cukup kuat; XAUUSD H4/M15 LEMAH, jangan diperlakukan
+    sebagai edge terbukti.
+
+    KETERBATASAN: (1) n trade BERKORELASI (duplikat setup, lihat analisis di
+    atas), sampel efektif jauh lebih kecil dari n; (2) filter/parameter dikalibrasi dari data yg sebagian sama --
+    bukan out-of-sample murni; (3) proxy PAXGUSDT, tanpa spread/slippage/
+    komisi broker (paling berpengaruh di M15); (4) tradeable=True tetap
+    "lolos filter konservatif", BUKAN jaminan probabilitas.
+
+    ATURAN UNTUK KOMENTAR/DOCSTRING WIN-RATE DI FILE INI KE DEPAN: setiap
+    klaim angka win rate/expectancy WAJIB mencantumkan (1) tanggal run,
+    (2) skrip & command persis yang dipakai, (3) jumlah trade SELESAI
+    (n_decided) per kombinasi, (4) simbol & rentang tanggal data. Klaim
+    tanpa keempat hal itu tidak boleh dipakai sebagai dasar keputusan filter
+    -- itu persis yang membuat klaim 90-97% di atas jadi tidak bisa
+    diverifikasi ulang.
+
+    CATATAN: kesimpulan di atas dari backtest pakai struktur proxy PAXGUSDT
+    (BUKAN histori XAUUSD asli), tanpa slippage/komisi/spread broker riil,
+    bukan jaminan berlaku selamanya/di semua kondisi. Kalibrasi ulang kalau
+    ada bukti baru -- tapi WAJIB sampling ulang, jangan asumsikan hasil lama
+    (termasuk kesimpulan sementara di atas) otomatis masih benar.
     """
     if s.get("direction") == "NEUTRAL":
         return {"tradeable": False, "path": None,
                 "reason": "Tidak ada sinyal arah (skor di zona NEUTRAL, tidak ada setup)."}
+
+    block_reason = TRADEABLE_BLOCKLIST.get((asset_class, (tf_label or "").upper()))
+    if block_reason:
+        return {"tradeable": False, "path": None,
+                "reason": f"[BLOCKED] Kombinasi {asset_class}/{tf_label} diblokir dari "
+                           f"tradeable=True karena bukti EV negatif ({block_reason}). "
+                           f"Setup tetap ditampilkan apa adanya di laporan."}
+
+    # Sanity-check skala harga (jaring pengaman untuk bug price-scale
+    # mismatch, lihat build_setup()/pick_ob()) -- kalau structure_source
+    # bukan "native"/fallback-tanpa-key (artinya struct_df punya sumber
+    # harga TERPISAH dari df proxy) dan selisih price vs struct_price di
+    # luar rentang wajar, JANGAN percaya tradeable=True: level entry/SL/OB
+    # yang dipilih berpotensi tercemar skala. Ini juga jaring pengaman kalau
+    # nanti sumber struktur lain (bukan TwelveData) ditambahkan dengan basis
+    # harga yang lebih jauh berbeda lagi.
+    price_now = a.get("price")
+    struct_price = a.get("struct_price")
+    src = a.get("structure_source", "native")
+    if (price_now is not None and struct_price is not None and price_now != 0
+            and src not in ("native",) and not src.startswith("paxg_fallback")):
+        scale_gap_pct = abs(price_now - struct_price) / price_now * 100
+        if scale_gap_pct > 0.5:
+            return {"tradeable": False, "path": None,
+                    "reason": f"[SAFETY] Selisih skala harga proxy vs struktur ({src}) "
+                               f"{scale_gap_pct:.2f}% -- di luar batas wajar (>0.5%). "
+                               f"Entry/SL/OB berpotensi tidak sinkron skala, tradeable "
+                               f"dipaksa False sampai ini dicek manual."}
 
     tier_ok = s.get("tier") == "A"
     bias = a.get("structure", {}).get("bias")
@@ -1583,10 +1743,14 @@ def evaluate_tradeable(a: dict, s: dict, order_type: str = None) -> dict:
     if has_fresh_ob and is_pending_limit:
         bias_note = (f"struktur HTF '{bias}' sudah confirmed juga (bonus konteks)"
                       if bias_confirmed else
-                      f"struktur HTF '{bias}' belum confirmed, tapi terbukti tidak signifikan di backtest")
+                      f"struktur HTF '{bias}' belum confirmed, tapi bias HTF tidak terbukti "
+                      f"signifikan di backtest manapun sejauh ini")
         return {"tradeable": True, "path": "fresh_ob_pending",
                 "reason": f"Tier A, entry dari Order Block asli (BOS), order {order_type} "
-                           f"(pending, tidak mengejar harga) -- {bias_note}."}
+                           f"(pending, tidak mengejar harga) -- {bias_note}. CATATAN: lolos "
+                           f"filter konservatif, BUKAN jaminan win rate tinggi -- lihat "
+                           f"docstring evaluate_tradeable() untuk hasil backtest terbaru "
+                           f"per simbol/timeframe sebelum eksekusi."}
 
     reasons = []
     if not has_fresh_ob:
@@ -1854,7 +2018,16 @@ def print_report(display_symbol, binance_symbol, tf_label, a, s, asset_class,
 # =============================================================================
 # 9. CHART (opsional)
 # =============================================================================
-def plot_chart(display_symbol, binance_symbol, tf_label, df, a, s, window=120):
+def plot_chart(display_symbol, binance_symbol, tf_label, df, a, s, window=120, out_dir=None):
+    """
+    out_dir : direktori tujuan penyimpanan PNG (absolute path). Kalau None,
+              simpan di cwd (perilaku lama, CLI). SENGAJA tidak pakai
+              os.chdir() supaya aman dipanggil dari banyak thread sekaligus
+              (server.py via FastAPI threadpool) -- os.chdir() mengubah cwd
+              milik SELURUH proses, bukan per-thread, jadi request paralel
+              bisa saling menimpa cwd satu sama lain dan menyimpan/mencari
+              file di direktori yang salah.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1888,15 +2061,18 @@ def plot_chart(display_symbol, binance_symbol, tf_label, df, a, s, window=120):
     plt.xticks(rotation=30)
     plt.tight_layout()
     fname = f"chart_{display_symbol}_{tf_label}_v2.png"
-    plt.savefig(fname, dpi=110)
+    fpath = os.path.join(out_dir, fname) if out_dir else fname
+    plt.savefig(fpath, dpi=110)
     plt.close()
-    print(f"  [chart disimpan: {fname}]")
+    print(f"  [chart disimpan: {fpath}]")
+    return fpath
 
 
 # =============================================================================
 # 10. MAIN
 # =============================================================================
-def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
+def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None,
+        only_tradeable=False):
     display, bsym, is_alias = resolve_symbol(symbol)
     bint, tf_label = parse_timeframe(interval)
     asset_class = "xau" if is_alias else "crypto"
@@ -1929,12 +2105,25 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
     spot_price, spot_label = fetch_spot_crosscheck(bsym)
     cot_data = fetch_cot_gold() if (cot and asset_class == "xau") else None
 
-    print_report(display, bsym, tf_label, a, s, asset_class,
-                 is_alias=is_alias, spot_price=spot_price, spot_label=spot_label, cot=cot_data)
-
     order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
     resolved_order_type = order_type_detail["type"] or s["order_type"]
-    tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type)
+    tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type,
+                                       asset_class=asset_class, tf_label=tf_label)
+
+    # Mode opsional --only-tradeable: hanya tampilkan setup kalau Tier A DAN
+    # tradeable=True. Kalau tidak, JANGAN cetak entry/SL/TP (supaya tidak
+    # disalahgunakan), cukup alasan kenapa tidak lolos. Default MATI --
+    # SOP standar tetap menampilkan semua tier apa adanya.
+    if only_tradeable and not tradeable_eval["tradeable"]:
+        print(f"\n[{display} {tf_label}] TIDAK ADA SETUP yang memenuhi syarat "
+              f"(wajib Tier A + tradeable=True) saat ini.")
+        print(f"  Tier saat ini : {s.get('tier')}")
+        print(f"  Alasan        : {tradeable_eval['reason']}")
+        print("  Coba lagi saat candle berikutnya close.\n")
+        return a, s
+
+    print_report(display, bsym, tf_label, a, s, asset_class,
+                 is_alias=is_alias, spot_price=spot_price, spot_label=spot_label, cot=cot_data)
     tag = "LAYAK (OB asli + LIMIT pending, tidak mengejar harga)" if tradeable_eval["tradeable"] else "MARJINAL/SKIP"
     print(f"  [FILTER KONSERVATIF] {tag} -- {tradeable_eval['reason']}\n")
 
@@ -1956,13 +2145,17 @@ def main():
     ap.add_argument("--dxy-bias", choices=["bullish", "bearish", "neutral"], default=None,
                      help="Override manual bias DXY/macro (khusus XAU), karena real yield & "
                           "ekspektasi Fed tidak tersedia via API gratis")
+    ap.add_argument("--only-tradeable", action="store_true",
+                     help="Hanya tampilkan setup kalau Tier A DAN tradeable=True; kalau tidak, "
+                          "cuma cetak alasannya (tanpa entry/SL/TP)")
     ap.add_argument("--list", nargs="+", metavar="SYM", help="Analisis banyak simbol sekaligus")
     args = ap.parse_args()
 
     targets = args.list if args.list else [args.symbol]
     for sym in targets:
         try:
-            run(sym, args.interval, rr=args.rr, chart=args.chart, cot=args.cot, dxy_bias=args.dxy_bias)
+            run(sym, args.interval, rr=args.rr, chart=args.chart, cot=args.cot,
+                dxy_bias=args.dxy_bias, only_tradeable=args.only_tradeable)
         except ValueError as e:
             print(f"[error] {e}")
             if not args.list:
