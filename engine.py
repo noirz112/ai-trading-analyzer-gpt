@@ -1538,6 +1538,43 @@ def build_setup(a: dict, rr: float = 2.0) -> dict:
                 entry_basis=entry_basis, order_block=ob_used, tier=tier)
 
 
+def evaluate_tradeable(a: dict, s: dict) -> dict:
+    """
+    Filter KONSERVATIF tambahan -- TIDAK menghapus atau menyembunyikan setup
+    apa pun dari laporan (SOP: semua tier tetap ditampilkan apa adanya).
+    Ini cuma flag rekomendasi: "tradeable" = True HANYA kalau DUA syarat
+    terpenuhi sekaligus:
+      1) tier == "A"          -> risk sudah tertutup penuh oleh TP1
+      2) structure.bias != "ranging" -> HTF sudah HH-HL (bullish) atau
+         LH-LL (bearish) yang bersih, bukan sekadar konsolidasi
+
+    Alasan/kalibrasi: 2026-09-23, 3 setup XAUUSD H1/H4 berturut-turut
+    (2 SHORT + 1 LONG) sama-sama Tier B DAN struktur ranging saat entry --
+    ketiganya kena SL. n=3, INDIKATIF SAJA (bukan bukti statistik kuat) --
+    re-kalibrasi kalau pola yang lebih luas ternyata tidak konsisten dengan
+    ini (misal Tier A + ranging juga sering gagal, atau Tier B + trend
+    bersih justru sering profit).
+    """
+    if s.get("direction") == "NEUTRAL":
+        return {"tradeable": False,
+                "reason": "Tidak ada sinyal arah (skor di zona NEUTRAL, tidak ada setup)."}
+
+    tier_ok = s.get("tier") == "A"
+    bias = a.get("structure", {}).get("bias")
+    bias_ok = bias in ("bullish", "bearish")
+
+    reasons = []
+    if not tier_ok:
+        reasons.append(f"Tier {s.get('tier')} (bukan A) -- risk belum tertutup penuh oleh TP1.")
+    if not bias_ok:
+        reasons.append(f"Struktur HTF '{bias}' (ranging/konsolidasi) -- belum ada HH-HL/LH-LL bersih.")
+    tradeable = tier_ok and bias_ok
+    if tradeable:
+        reasons.append("Tier A dan struktur HTF searah trade (bukan ranging).")
+
+    return {"tradeable": tradeable, "reason": "; ".join(reasons)}
+
+
 # =============================================================================
 # 8. REPORT PRINTER
 # =============================================================================
@@ -1869,6 +1906,10 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None):
 
     print_report(display, bsym, tf_label, a, s, asset_class,
                  is_alias=is_alias, spot_price=spot_price, spot_label=spot_label, cot=cot_data)
+
+    tradeable_eval = evaluate_tradeable(a, s)
+    tag = "LAYAK (Tier A, struktur searah trend)" if tradeable_eval["tradeable"] else "MARJINAL/SKIP"
+    print(f"  [FILTER KONSERVATIF] {tag} -- {tradeable_eval['reason']}\n")
 
     if chart:
         try:
