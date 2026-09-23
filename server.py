@@ -132,7 +132,10 @@ def analyze(
         # di broker mereka. order_type juga diklasifikasikan ulang di sini
         # (BUY/SELL LIMIT vs STOP vs MARKET) dengan membandingkan entry ke
         # spot_price -- bukan sekadar label generik "LIMIT/MARKET".
-        order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
+        # Crypto: tidak ada spot_price terpisah -> pakai harga live Binance sbg referensi
+        # (fix: tanpa ini tradeable tidak pernah True utk BTC/ETH, tidak konsisten dgn backtest).
+        ref_price = spot_price if spot_price else (a["price"] if asset_class == "crypto" else None)
+        order_type_detail = classify_order_type(s["direction"], s["entry"], ref_price)
         resolved_order_type = order_type_detail["type"] or s["order_type"]
 
         # Filter konservatif tambahan (lihat evaluate_tradeable() di engine.py):
