@@ -2105,7 +2105,12 @@ def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None,
     spot_price, spot_label = fetch_spot_crosscheck(bsym)
     cot_data = fetch_cot_gold() if (cot and asset_class == "xau") else None
 
-    order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
+    # Crypto tidak punya spot_price terpisah (SPOT_CHECK hanya utk PAXG) -> sebelumnya
+    # type=None -> label generik "LIMIT/MARKET" -> tradeable TIDAK PERNAH True utk
+    # BTC/ETH di jalur live (padahal backtest memakai harga bar sbg referensi).
+    # Fix: utk crypto, pakai harga live Binance sbg referensi (sumber yg sama dgn entry).
+    ref_price = spot_price if spot_price else (a["price"] if asset_class == "crypto" else None)
+    order_type_detail = classify_order_type(s["direction"], s["entry"], ref_price)
     resolved_order_type = order_type_detail["type"] or s["order_type"]
     tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type,
                                        asset_class=asset_class, tf_label=tf_label)
