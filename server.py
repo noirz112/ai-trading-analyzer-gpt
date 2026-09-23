@@ -121,12 +121,13 @@ def analyze(
         # (BUY/SELL LIMIT vs STOP vs MARKET) dengan membandingkan entry ke
         # spot_price -- bukan sekadar label generik "LIMIT/MARKET".
         order_type_detail = classify_order_type(s["direction"], s["entry"], spot_price)
+        resolved_order_type = order_type_detail["type"] or s["order_type"]
 
         # Filter konservatif tambahan (lihat evaluate_tradeable() di engine.py):
-        # tradeable=True HANYA kalau tier A DAN struktur HTF tidak ranging.
-        # TIDAK menyembunyikan setup Tier B/C -- laporan tetap tampil penuh,
-        # ini cuma flag rekomendasi ekstra buat GPT/user memutuskan.
-        tradeable_eval = evaluate_tradeable(a, s)
+        # tradeable=True lewat jalur "confirmed" (bias mapan) ATAU jalur
+        # "fresh_ob_pending" (OB asli + order LIMIT, tidak mengejar harga).
+        # TIDAK menyembunyikan setup Tier B/C -- laporan tetap tampil penuh.
+        tradeable_eval = evaluate_tradeable(a, s, order_type=resolved_order_type)
         spot_spread = None
         spot_spread_pct = None
         if spot_price:
@@ -176,6 +177,7 @@ def analyze(
             } if ob else None),
             "tier": s.get("tier"),
             "tradeable": tradeable_eval["tradeable"],
+            "tradeable_path": tradeable_eval["path"],
             "tradeable_reason": tradeable_eval["reason"],
             "sl": s["sl"],
             "tp1": s["tp1"],
