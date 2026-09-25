@@ -2069,6 +2069,497 @@ def plot_chart(display_symbol, binance_symbol, tf_label, df, a, s, window=120, o
 
 
 # =============================================================================
+# 9b. SCALPING CASCADE (XAUUSD-ONLY) — waterfall confluence 5 sub-metode
+# =============================================================================
+# SOP scalping terpisah dari engine swing di atas. TIDAK dipakai untuk crypto
+# (lihat catatan proyek: metode ini hanya jalan di XAUUSD). Reuse komponen
+# struktur/SMC yang sudah ada (find_swings, classify_structure,
+# find_liquidity_pools, mark_swept_pools, find_fair_value_gaps,
+# find_order_blocks, mark_mitigated_ob, classify_tier) -- TIDAK reimplementasi
+# ulang deteksi struktur dasar.
+#
+# Waterfall (dicoba berurutan, berhenti di match PERTAMA — kualitas tinggi ke
+# rendah sesuai urutan diskusi SOP):
+#   1. Sweep -> Displacement -> CHoCH/MSS -> entry di edge FVG/OB (LIMIT)
+#   2. Retest OB/S&D TANPA syarat sweep baru (MARKET, retest sudah terkonfirmasi)
+#   3. BOS continuation + pullback ke fib 50-61.8% (LIMIT)
+#   4. Rejection candle/pin bar di key level (MARKET, pola baru closed)
+#   5. Failed breakout/failed auction (MARKET, baru closed kembali ke dalam)
+#
+# Window/recency: hanya candle trigger dalam SCALP_LOOKBACK_CANDLES terakhir
+# yang dianggap "segar" (SOP: mode scalping pakai 5 candle terakhir).
+#
+# SL/TP: BUKAN skala swing. Tiap sub-metode punya basis SL sendiri (sweep
+# extreme / OB edge / awal impulse / wick pin bar / breakout extreme + buffer)
+# tapi hasil akhirnya di-sanity-check terhadap SCALP_SL_MIN_PIPS/MAX_SL_PIPS
+# (rentang "beberapa puluh pips" sesuai SOP) -- kalau risk di luar rentang itu,
+# setup DIBUANG (bukan scalping lagi, kemungkinan struktur salah timeframe).
+# TP1/2/3 pakai RR tetap (SCALP_RR_TP) dari risk aktual, bukan liquidity pool
+# terjauh seperti mode swing -- konsisten dengan filosofi "masuk-keluar cepat".
+#
+# BELUM DIKALIBRASI: parameter di bawah (body_mult displacement, wick/body
+# ratio pin bar, toleransi key level, rentang SL pip) adalah nilai desain
+# awal untuk skeleton ini, BELUM divalidasi lewat backtest per sub-metode
+# (SOP: backtest wajib per sub-metode sebelum dipakai live -- lihat catatan
+# proyek). Jangan anggap ini kalibrasi final.
+SCALP_PIP_SIZE = 0.1            # asumsi 1 pip XAUUSD = $0.1 (quoting 2 desimal) -- sesuaikan
+                                 # kalau feed broker user pakai konvensi lain
+SCALP_SL_MIN_PIPS = 8
+SCALP_SL_MAX_PIPS = 40
+SCALP_SL_BUFFER_PIPS = 2
+SCALP_RR_TP = (1.0, 1.5, 2.0)   # RR tetap TP1/TP2/TP3 dari risk aktual
+SCALP_LOOKBACK_CANDLES = 5
+SCALP_DISPLACEMENT_BODY_MULT = 1.3
+SCALP_PIN_WICK_BODY_RATIO = 2.0
+SCALP_KEY_LEVEL_TOL_PCT = 0.0015
+
+# --- Cooldown/dedup sinyal (fix 2026-09-25, lihat analisis backtest) --------
+# Backtest declustering (analyze_spread_and_clustering.py) menemukan sub-metode
+# tertentu -- terutama "Rejection candle/pin bar" -- menembak ulang sinyal
+# SERUPA di harga/waktu yang nyaris sama, candle demi candle, sepanjang satu
+# trending move. Di backtest mentah itu terhitung sebagai puluhan ribu
+# kemenangan independen, padahal itu 1 kemenangan besar dihitung berkali-kali
+# (portfolio expectancy anjlok 0.514R -> 0.146R setelah declustered, lihat
+# catatan analisis). Kalau ini tidak difilter DI TITIK SINYAL DIHASILKAN, ini
+# bukan cuma bias statistik backtest -- di live ini artinya bot bisa buka
+# banyak posisi SEARAH yang sebenarnya satu bet yang sama (leverage
+# tersembunyi: begitu market reversal tajam, semua posisi itu kena bareng).
+#
+# Ambang di bawah SENGAJA disamakan dengan CLUSTER_BAR_GAP_MAX/
+# CLUSTER_PIP_GAP_MAX di analyze_spread_and_clustering.py, supaya definisi
+# "sinyal independen" konsisten antara apa yang lolos live/backtest dan apa
+# yang dihitung sebagai 1 cluster saat analisis. Kalau salah satu diubah,
+# ubah juga yang lain.
+SCALP_COOLDOWN_BAR_GAP_MAX = 3      # <= 3 candle sejak sinyal terakhir
+                                     # (sub_method + direction sama) -> duplikat
+SCALP_COOLDOWN_PIP_GAP_MAX = 3.0    # DAN entry beda <= 3 pip -> duplikat
+
+# PERBAIKAN (2026-09-26): ditemukan dari inspeksi hotspot 2025-08-20 --
+# cooldown di atas (bar+entry saja) LOLOS untuk kasus "harga choppy di
+# sekitar 1 level struktural, entry bergeser >3 pip tiap attempt, tapi SL
+# PERSIS SAMA (level referensi identik)". Cek sistematis atas seluruh
+# histori (lihat check_same_sl_dedup_gap.py) menunjukkan ini bukan kasus
+# langka: 23.94% dari seluruh sinyal berurutan (semua sub-metode) punya
+# pola ini -- Failed breakout & Rejection candle di 22-26%. SL identik
+# adalah sinyal lebih kuat "level/kejadian yang sama" daripada jarak entry
+# semata, jadi ditambahkan sebagai syarat TAMBAHAN: kandidat dianggap
+# duplikat (dan ditolak) kalau bar dekat DAN (entry dekat ATAU SL identik).
+SCALP_COOLDOWN_SL_GAP_MAX_PIP = 0.5  # SL beda <= ini dianggap "level sama"
+
+# --- Concurrency cap SEARAH (2026-09-26) -------------------------------------
+# KENAPA INI BERBEDA DARI COOLDOWN DI ATAS: cooldown di atas cuma mendedup
+# sinyal (sub_method + direction) YANG SAMA yang beruntun -- itu tidak
+# mencegah, misalnya, "Rejection candle" LONG + "Failed breakout" LONG fire
+# nyaris bersamaan (dua sub-metode BEDA, arah SAMA), yang tetap 2 posisi
+# searah kalau dieksekusi berbarengan (lihat temuan check_concurrency.py).
+#
+# TIDAK BISA di-cap otomatis dari sisi df/candle di sini, karena server.py
+# adalah API sinyal MURNI (lihat header server.py) -- engine ini TIDAK PERNAH
+# tahu posisi mana yang masih terbuka di broker (tidak ada koneksi broker,
+# eksekusi dilakukan manual oleh user di MT5). Maka cap ini BUKAN otomatis:
+# ia hanya aktif kalau caller (server.py, lewat parameter open_long/open_short
+# dari user/Custom GPT) MELAPORKAN sendiri berapa posisi searah yang ia tahu
+# sedang terbuka saat ini. open_positions default {} / semua 0 -> cap ini
+# efeknya TIDAK AKTIF (backward compatible, termasuk untuk backtest yang
+# tidak mensimulasikan status posisi riil sama sekali).
+#
+# KALIBRASI (2026-09-26): dulu tebakan awal, sekarang sudah divalidasi dari
+# data historis (33748 sinyal, setelah fix cooldown SL-based di atas
+# menghapus duplikat yang tadinya menginflate concurrency). Hasil
+# check_concurrency.py untuk 2 kandidat live (Rejection candle + Failed
+# breakout, GABUNGAN searah): level 0-1 mencakup ~91-98% waktu (aman),
+# level 2 ~5-6.5% waktu, level 3+ ~2-3% waktu, max historis 7-8 (langka,
+# didominasi 1 hotspot 2025-08-20 yang sudah diverifikasi manual --
+# choppy whipsaw di 1 level, bukan breakout riil). Cap=2 artinya begitu 2
+# posisi searah terbuka (lintas sub-metode), sinyal ke-3 searah diblok --
+# ini pas menutup celah "leverage tersembunyi" yang jadi alasan awal cap
+# ini dibuat. Kalau nanti data live/backtest bertambah signifikan, ulangi
+# check_concurrency.py untuk re-validasi, jangan anggap angka ini final
+# selamanya.
+SCALP_MAX_CONCURRENT_SAME_DIRECTION = 2
+
+# State per-proses: {(sub_method_label, direction): {"time": Timestamp, "entry": float}}
+# Modul-level SENGAJA (bukan argumen fungsi) supaya persist otomatis antar
+# panggilan detect_scalp_cascade() berturut-turut -- baik loop live di
+# server.py (tiap request /analyze-scalp, proses yang sama tetap hidup)
+# maupun backtest candle-by-candle. Konsekuensinya: WAJIB panggil
+# reset_scalp_cooldown_state() di awal tiap backtest run yang berdiri
+# sendiri (lihat backtest_scalp_cascade.py) -- kalau tidak, run kedua di
+# proses yang sama akan "mewarisi" cooldown residual dari run pertama.
+_SCALP_LAST_SIGNAL = {}
+
+
+def reset_scalp_cooldown_state():
+    """Reset state cooldown/dedup sinyal scalp. WAJIB dipanggil di awal tiap
+    backtest run (supaya run tidak mewarisi residual dari run sebelumnya di
+    proses yang sama). Di live (server.py) TIDAK perlu dipanggil -- justru
+    state yang persist antar request itu tujuannya."""
+    _SCALP_LAST_SIGNAL.clear()
+
+
+def _scalp_infer_bar_seconds(df: pd.DataFrame):
+    """Infer lebar 1 bar (detik) dari 2 candle terakhir di df. Dibuat generik
+    (bukan hardcode 300 detik/M5) supaya cooldown tetap benar kalau dipanggil
+    dari timeframe lain (server.py mendukung M1-D1 utk /analyze-scalp)."""
+    if "open_time" not in df.columns or len(df) < 2:
+        return None
+    delta = df["open_time"].iloc[-1] - df["open_time"].iloc[-2]
+    secs = delta.total_seconds()
+    return secs if secs > 0 else None
+
+
+def _scalp_is_duplicate_signal(df: pd.DataFrame, sub_method_label: str,
+                                direction: str, entry: float, sl: float) -> bool:
+    """True kalau kandidat sinyal ini kemungkinan duplikat beruntun dari
+    sinyal (sub_method + direction) sama yang baru saja fire -- jarak waktu
+    (dikonversi ke 'jumlah bar', bukan hardcode) DAN (jarak entry ATAU SL
+    identik), definisi sama persis dengan clustering di
+    analyze_spread_and_clustering.py (termasuk fix SL 2026-09-26: SL
+    identik = level struktural sama = tetap duplikat, walau entry bergeser
+    jauh saat harga choppy di sekitar level itu).
+    Fail-OPEN (return False) kalau tidak bisa dievaluasi (mis. tidak ada
+    kolom open_time) -- supaya bug di sini gagal dengan cara yang KELIHATAN
+    (sinyal tetap keluar apa adanya) bukan diam-diam memblokir semua sinyal."""
+    key = (sub_method_label, direction)
+    last = _SCALP_LAST_SIGNAL.get(key)
+    if last is None or last.get("time") is None:
+        return False
+    bar_seconds = _scalp_infer_bar_seconds(df)
+    if not bar_seconds:
+        return False
+    cur_time = df["open_time"].iloc[-1]
+    bar_gap = (cur_time - last["time"]).total_seconds() / bar_seconds
+    pip_gap = abs(entry - last["entry"]) / SCALP_PIP_SIZE
+    sl_gap = abs(sl - last["sl"]) / SCALP_PIP_SIZE
+    same_level = (pip_gap <= SCALP_COOLDOWN_PIP_GAP_MAX
+                  or sl_gap <= SCALP_COOLDOWN_SL_GAP_MAX_PIP)
+    return bar_gap <= SCALP_COOLDOWN_BAR_GAP_MAX and same_level
+
+
+def _scalp_record_signal(df: pd.DataFrame, sub_method_label: str,
+                          direction: str, entry: float, sl: float) -> None:
+    cur_time = df["open_time"].iloc[-1] if "open_time" in df.columns else None
+    _SCALP_LAST_SIGNAL[(sub_method_label, direction)] = {
+        "time": cur_time, "entry": entry, "sl": sl,
+    }
+
+
+def _scalp_finalize(sub_method: int, label: str, direction: str, entry, sl,
+                     entry_type: str, basis_note: str):
+    """Bangun output setup scalping final + guard rentang SL wajar (pips)."""
+    if direction not in ("bullish", "bearish") or entry is None or sl is None:
+        return None
+    entry = float(entry)
+    sl = float(sl)
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    risk_pips = risk / SCALP_PIP_SIZE
+    if risk_pips < SCALP_SL_MIN_PIPS or risk_pips > SCALP_SL_MAX_PIPS:
+        return None
+    rr_dir = 1 if direction == "bullish" else -1
+    tp1 = entry + rr_dir * risk * SCALP_RR_TP[0]
+    tp2 = entry + rr_dir * risk * SCALP_RR_TP[1]
+    tp3 = entry + rr_dir * risk * SCALP_RR_TP[2]
+    tier = classify_tier(risk, abs(tp1 - entry), abs(tp2 - entry))
+    return {
+        "sub_method": sub_method,
+        "sub_method_label": label,
+        "direction": "LONG" if direction == "bullish" else "SHORT",
+        "entry_type": entry_type,
+        "entry": round(entry, 4),
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "risk_pips": round(risk_pips, 1),
+        "tier": tier,
+        "basis_note": basis_note,
+    }
+
+
+def _scalp_has_displacement(df, start_idx, end_idx, direction,
+                             body_mult=SCALP_DISPLACEMENT_BODY_MULT, hist_window=20):
+    """Cari candle displacement (body besar, searah `direction`) di [start_idx, end_idx]."""
+    bodies = (df["close"] - df["open"]).abs()
+    hist_start = max(0, start_idx - hist_window)
+    avg_body = bodies.iloc[hist_start:start_idx].mean()
+    if not avg_body or avg_body <= 0 or np.isnan(avg_body):
+        return None
+    for i in range(start_idx, end_idx + 1):
+        is_up = df["close"].iloc[i] > df["open"].iloc[i]
+        same_dir = (direction == "bullish" and is_up) or (direction == "bearish" and not is_up)
+        if same_dir and bodies.iloc[i] >= body_mult * avg_body:
+            return i
+    return None
+
+
+def detect_pin_bar(df, idx, wick_body_ratio=SCALP_PIN_WICK_BODY_RATIO, close_pos_pct=0.6):
+    """Pin bar / rejection candle sederhana di candle `idx`. Return 'bullish'/'bearish'/None."""
+    o = float(df["open"].iloc[idx]); h = float(df["high"].iloc[idx])
+    l = float(df["low"].iloc[idx]); c = float(df["close"].iloc[idx])
+    rng = h - l
+    if rng <= 0:
+        return None
+    body = abs(c - o) or rng * 0.001
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    if lower_wick >= wick_body_ratio * body and lower_wick > upper_wick * 1.2 and (c - l) >= rng * close_pos_pct:
+        return "bullish"
+    if upper_wick >= wick_body_ratio * body and upper_wick > lower_wick * 1.2 and (h - c) >= rng * close_pos_pct:
+        return "bearish"
+    return None
+
+
+def _scalp_sub1_sweep_displacement_choch(df, pools, structure, recent_start, last_idx):
+    """Sub 1: Sweep -> Displacement -> CHoCH/MSS searah -> entry LIMIT di edge FVG/OB."""
+    sweeps = []
+    for p in pools:
+        seg_start = max(p["last_idx"] + 1, recent_start)
+        for i in range(seg_start, last_idx + 1):
+            if p["side"] == "buyside" and df["high"].iloc[i] > p["price"] and df["close"].iloc[i] < p["price"]:
+                sweeps.append({"pool": p, "sweep_idx": i, "direction": "bearish"})
+            elif p["side"] == "sellside" and df["low"].iloc[i] < p["price"] and df["close"].iloc[i] > p["price"]:
+                sweeps.append({"pool": p, "sweep_idx": i, "direction": "bullish"})
+    if not sweeps:
+        return None
+    sweeps.sort(key=lambda x: x["sweep_idx"], reverse=True)
+    sw = sweeps[0]
+    direction, sweep_idx = sw["direction"], sw["sweep_idx"]
+
+    disp_idx = _scalp_has_displacement(df, sweep_idx, last_idx, direction)
+    if disp_idx is None:
+        return None
+
+    bos, bos_idx = structure.get("bos"), structure.get("bos_idx")
+    if not (bos is not None and bos_idx is not None and bos[0] == direction and bos_idx >= sweep_idx):
+        return None  # CHoCH/MSS searah belum terkonfirmasi
+
+    zone = None
+    obs = mark_mitigated_ob(df, find_order_blocks(df, bos, bos_idx))
+    for ob in obs:
+        if ob["type"] == direction and not ob.get("mitigated") and ob["idx"] >= sweep_idx - 5:
+            zone = {"low": ob["low"], "high": ob["high"], "kind": "OB"}
+            break
+    if zone is None:
+        for g in find_fair_value_gaps(df):
+            if g["type"] == direction and g["idx"] >= sweep_idx:
+                zone = {"low": g["zone_low"], "high": g["zone_high"], "kind": "FVG"}
+                break
+    if zone is None:
+        return None
+
+    if direction == "bullish":
+        entry = zone["high"]
+        sl = min(float(df["low"].iloc[sweep_idx]), zone["low"]) - SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+    else:
+        entry = zone["low"]
+        sl = max(float(df["high"].iloc[sweep_idx]), zone["high"]) + SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+
+    basis = (f"Sweep {sw['pool']['side']} @ {sw['pool']['price']:.2f} (candle #{sweep_idx}) -> "
+             f"displacement (#{disp_idx}) -> CHoCH searah (BOS #{bos_idx}) -> "
+             f"entry limit di edge {zone['kind']} {zone['low']:.2f}-{zone['high']:.2f}")
+    return _scalp_finalize(1, "Sweep->Displacement->CHoCH->FVG/OB", direction, entry, sl, "limit", basis)
+
+
+def _scalp_sub2_ob_retest(df, structure, recent_start, last_idx):
+    """Sub 2: retest OB/S&D TANPA syarat sweep baru -> entry MARKET (retest sudah closed)."""
+    bos, bos_idx = structure.get("bos"), structure.get("bos_idx")
+    if bos is None:
+        return None
+    direction = bos[0]
+    obs = mark_mitigated_ob(df, find_order_blocks(df, bos, bos_idx, max_lookback=60))
+    for ob in obs:
+        if ob["type"] != direction:
+            continue
+        for i in range(recent_start, last_idx + 1):
+            if i <= ob["idx"]:
+                continue
+            touched = df["low"].iloc[i] <= ob["high"] and df["high"].iloc[i] >= ob["low"]
+            if not touched:
+                continue
+            if direction == "bullish" and df["close"].iloc[i] > ob["high"]:
+                entry = float(df["close"].iloc[i])
+                sl = ob["low"] - SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+                basis = f"Retest OB bullish {ob['low']:.2f}-{ob['high']:.2f} @ candle #{i}, tanpa syarat sweep baru"
+                return _scalp_finalize(2, "OB/S&D retest tanpa sweep", direction, entry, sl, "market", basis)
+            if direction == "bearish" and df["close"].iloc[i] < ob["low"]:
+                entry = float(df["close"].iloc[i])
+                sl = ob["high"] + SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+                basis = f"Retest OB bearish {ob['low']:.2f}-{ob['high']:.2f} @ candle #{i}, tanpa syarat sweep baru"
+                return _scalp_finalize(2, "OB/S&D retest tanpa sweep", direction, entry, sl, "market", basis)
+    return None
+
+
+def _scalp_sub3_bos_pullback(df, structure, recent_start, last_idx):
+    """Sub 3: BOS continuation + pullback ke fib 50-61.8% -> entry LIMIT."""
+    bos, bos_idx = structure.get("bos"), structure.get("bos_idx")
+    if bos is None:
+        return None
+    direction, break_level = bos
+    seg = df.iloc[bos_idx:last_idx + 1]
+    if seg.empty:
+        return None
+
+    if direction == "bullish":
+        impulse_end = float(seg["high"].max())
+        if impulse_end <= break_level:
+            return None
+        rng = impulse_end - break_level
+        fib_low, fib_high = impulse_end - rng * 0.618, impulse_end - rng * 0.5
+        cur_low = float(df["low"].iloc[last_idx])
+        if not (fib_low <= cur_low <= fib_high):
+            return None
+        entry = fib_high
+        sl = break_level - SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+    else:
+        impulse_end = float(seg["low"].min())
+        if impulse_end >= break_level:
+            return None
+        rng = break_level - impulse_end
+        fib_high, fib_low = impulse_end + rng * 0.618, impulse_end + rng * 0.5
+        cur_high = float(df["high"].iloc[last_idx])
+        if not (fib_low <= cur_high <= fib_high):
+            return None
+        entry = fib_low
+        sl = break_level + SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+
+    basis = (f"BOS {direction} @ {break_level:.2f} (candle #{bos_idx}), harga sekarang di fib "
+             f"pullback 50-61.8% dari impulse leg")
+    return _scalp_finalize(3, "BOS continuation + pullback", direction, entry, sl, "limit", basis)
+
+
+def _scalp_sub4_pin_bar_key_level(df, pools, recent_start, last_idx, tol_pct=SCALP_KEY_LEVEL_TOL_PCT):
+    """Sub 4: rejection candle/pin bar di key level (liquidity pool) -> entry MARKET."""
+    key_levels = [p["price"] for p in pools]
+    if not key_levels:
+        return None
+    for i in range(last_idx, recent_start - 1, -1):
+        pin = detect_pin_bar(df, i)
+        if pin is None:
+            continue
+        px_low, px_high = float(df["low"].iloc[i]), float(df["high"].iloc[i])
+        ref = px_low if pin == "bullish" else px_high
+        if not any(abs(ref - lvl) / lvl <= tol_pct for lvl in key_levels):
+            continue
+        entry = float(df["close"].iloc[i])
+        if pin == "bullish":
+            sl = px_low - SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+        else:
+            sl = px_high + SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+        basis = f"Pin bar {pin} @ candle #{i} dekat key level {ref:.2f}"
+        return _scalp_finalize(4, "Rejection candle/pin bar di key level", pin, entry, sl, "market", basis)
+    return None
+
+
+def _scalp_sub5_failed_breakout(df, pools, swing_highs, swing_lows, recent_start, last_idx):
+    """Sub 5: failed breakout/failed auction di key level -> entry MARKET."""
+    levels = [("buyside", p["price"]) for p in pools if p["side"] == "buyside"]
+    levels += [("sellside", p["price"]) for p in pools if p["side"] == "sellside"]
+    levels += [("buyside", pr) for _, _, pr in swing_highs[-5:]]
+    levels += [("sellside", pr) for _, _, pr in swing_lows[-5:]]
+    for side, lvl in levels:
+        for i in range(recent_start, last_idx + 1):
+            if side == "buyside" and df["high"].iloc[i] > lvl:
+                seg = df.iloc[i:last_idx + 1]
+                if (seg["close"] < lvl).iloc[-1]:
+                    entry = float(df["close"].iloc[last_idx])
+                    sl = float(seg["high"].max()) + SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+                    basis = f"Failed breakout di atas {lvl:.2f} (candle #{i}), close kembali di bawah level"
+                    return _scalp_finalize(5, "Failed breakout/failed auction", "bearish", entry, sl, "market", basis)
+            if side == "sellside" and df["low"].iloc[i] < lvl:
+                seg = df.iloc[i:last_idx + 1]
+                if (seg["close"] > lvl).iloc[-1]:
+                    entry = float(df["close"].iloc[last_idx])
+                    sl = float(seg["low"].min()) - SCALP_SL_BUFFER_PIPS * SCALP_PIP_SIZE
+                    basis = f"Failed breakout di bawah {lvl:.2f} (candle #{i}), close kembali di atas level"
+                    return _scalp_finalize(5, "Failed breakout/failed auction", "bullish", entry, sl, "market", basis)
+    return None
+
+
+def detect_scalp_cascade(df: pd.DataFrame, lookback_candles: int = SCALP_LOOKBACK_CANDLES,
+                          open_positions: dict | None = None) -> dict:
+    """
+    Dispatcher cascade waterfall: coba sub 1..5 berurutan, kembalikan match
+    PERTAMA yang lolos guard SL. XAUUSD-only -- jangan panggil untuk crypto.
+    df harus struktur asli XAUUSD (df_structure dari get_structure_df, sama
+    seperti dipakai analyze_xau), BUKAN proxy PAXGUSDT kalau bisa dihindari.
+
+    open_positions: dict opsional {"LONG": n, "SHORT": n} -- jumlah posisi
+    SEARAH yang CALLER laporkan sendiri sedang terbuka di broker saat ini
+    (lihat catatan SCALP_MAX_CONCURRENT_SAME_DIRECTION di atas). Default None
+    -> diperlakukan {"LONG": 0, "SHORT": 0}, cap tidak pernah aktif (dipakai
+    apa adanya oleh backtest_scalp_cascade.py, yang tidak mensimulasikan
+    status posisi riil).
+    """
+    open_positions = open_positions or {}
+    swing_highs, swing_lows = find_swings(df)
+    structure = classify_structure(df, swing_highs, swing_lows)
+    pools = mark_swept_pools(df, find_liquidity_pools(swing_highs, swing_lows))
+    last_idx = len(df) - 1
+    recent_start = max(0, last_idx - lookback_candles + 1)
+
+    capped_candidates = []  # utk transparansi kalau semua kandidat kena cap
+
+    for fn, args in [
+        (_scalp_sub1_sweep_displacement_choch, (df, pools, structure, recent_start, last_idx)),
+        (_scalp_sub2_ob_retest, (df, structure, recent_start, last_idx)),
+        (_scalp_sub3_bos_pullback, (df, structure, recent_start, last_idx)),
+        (_scalp_sub4_pin_bar_key_level, (df, pools, recent_start, last_idx)),
+        (_scalp_sub5_failed_breakout, (df, pools, swing_highs, swing_lows, recent_start, last_idx)),
+    ]:
+        result = fn(*args)
+        if not result:
+            continue
+        # Cooldown/dedup: kalau kandidat ini kemungkinan duplikat beruntun
+        # dari sinyal (sub_method + direction) yang sama, JANGAN langsung
+        # hentikan cascade -- coba sub-metode berikutnya di waterfall,
+        # karena "sub 1 lagi cooldown" bukan berarti "tidak ada sinyal valid
+        # sama sekali di candle ini".
+        if _scalp_is_duplicate_signal(df, result["sub_method_label"],
+                                       result["direction"], result["entry"],
+                                       result["sl"]):
+            continue
+        # Concurrency cap SEARAH (lintas sub-metode) -- lihat catatan di
+        # SCALP_MAX_CONCURRENT_SAME_DIRECTION. Kalau caller melaporkan sudah
+        # ada >= cap posisi searah terbuka, kandidat ini di-skip (bukan
+        # otomatis dihentikan seluruh cascade -- arah BERLAWANAN tetap boleh
+        # lolos, karena itu bukan stacking risk yang sama).
+        if open_positions.get(result["direction"], 0) >= SCALP_MAX_CONCURRENT_SAME_DIRECTION:
+            capped_candidates.append(result)
+            continue
+        _scalp_record_signal(df, result["sub_method_label"],
+                              result["direction"], result["entry"], result["sl"])
+        return result
+
+    if capped_candidates:
+        blocked = capped_candidates[0]
+        return {
+            "sub_method": None,
+            "sub_method_label": None,
+            "direction": "NEUTRAL",
+            "blocked_by_concurrency_cap": True,
+            "reason": (
+                f"Kandidat valid ada ({blocked['sub_method_label']}, "
+                f"{blocked['direction']}) tapi ditahan: caller melaporkan "
+                f"sudah {open_positions.get(blocked['direction'], 0)} posisi "
+                f"{blocked['direction']} terbuka, >= cap "
+                f"SCALP_MAX_CONCURRENT_SAME_DIRECTION="
+                f"{SCALP_MAX_CONCURRENT_SAME_DIRECTION}. Tutup/kurangi posisi "
+                f"searah dulu di broker sebelum entry baru arah yang sama."
+            ),
+        }
+
+    return {
+        "sub_method": None,
+        "sub_method_label": None,
+        "direction": "NEUTRAL",
+        "reason": f"Tidak ada trigger valid di 5 sub-metode dalam {lookback_candles} candle terakhir "
+                  f"(atau kandidat yang ada masih dalam cooldown duplikat sinyal).",
+    }
+
+
+# =============================================================================
 # 10. MAIN
 # =============================================================================
 def run(symbol, interval, rr=2.0, chart=False, cot=False, dxy_bias=None,
