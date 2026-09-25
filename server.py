@@ -14,6 +14,13 @@ dipanggil Custom GPT lewat HTTP GET /analyze, bukan command line.
 ENDPOINT:
   GET /health
   GET /analyze?symbol=XAUUSD&interval=H1&rr=2&chart=false&cot=false&dxy_bias=neutral
+  GET /analyze-scalp?symbol=XAUUSD&interval=M5   <- KHUSUS XAUUSD, cascade waterfall
+                                                     5 sub-metode (lihat detect_scalp_cascade
+                                                     di engine.py). Parameter internal BELUM
+                                                     dikalibrasi lewat backtest -- pakai dulu
+                                                     utk forward-test akun DEMO + backtest data
+                                                     historis paralel, JANGAN live dgn uang riil
+                                                     sebelum kalibrasi selesai.
   GET /openapi.json   <- otomatis dari FastAPI, tinggal di-import ke GPT Action
 
 DEPLOY DI RAILWAY:
@@ -41,6 +48,8 @@ from engine import (
     analyze_crypto, analyze_xau, build_setup, fetch_spot_crosscheck,
     fetch_cot_gold, fetch_live_price, print_report, plot_chart,
     classify_order_type, get_structure_df, evaluate_tradeable,
+    detect_scalp_cascade, SCALP_LOOKBACK_CANDLES, SCALP_SL_MIN_PIPS,
+    SCALP_SL_MAX_PIPS, SCALP_PIP_SIZE, SCALP_MAX_CONCURRENT_SAME_DIRECTION,
 )
 
 app = FastAPI(
@@ -241,6 +250,130 @@ def analyze(
         # -> GPT dapat pesan error jelas, bukan 502.
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": f"Analisa gagal: {e}"})
+
+
+@app.get("/analyze-scalp")
+def analyze_scalp(
+    symbol: str = Query("XAUUSD", description="KHUSUS XAUUSD/XAU/GOLD -- endpoint ini menolak simbol crypto."),
+    interval: str = Query(..., description="M1, M5, M15, M30, H1, H4, D1 (scalp SOP: idealnya M1-M15)"),
+    open_long: int = Query(0, ge=0, description="WAJIB diisi jujur oleh caller (user/Custom GPT): "
+                            "berapa posisi LONG dari sistem ini yang SAAT INI masih terbuka di MT5. "
+                            "Server TIDAK bisa tahu ini sendiri (tidak ada koneksi broker) -- kalau "
+                            "diisi 0 padahal sebenarnya ada posisi terbuka, concurrency cap di bawah "
+                            "TIDAK akan bekerja."),
+    open_short: int = Query(0, ge=0, description="Sama seperti open_long, tapi untuk posisi SHORT."),
+):
+    """
+    Cascade waterfall 5 sub-metode scalping (lihat detect_scalp_cascade() di
+    engine.py) -- HANYA untuk XAUUSD, tidak menyentuh logika crypto sama
+    sekali. Beda total dari /analyze (mode swing): dispatcher coba sub 1
+    (sweep->displacement->CHoCH->FVG/OB) sampai sub 5 (failed breakout)
+    berurutan, kembalikan match PERTAMA yang lolos guard SL 8-40 pips
+    (SCALP_SL_MIN_PIPS/MAX_PIPS), hanya melihat 5 candle terakhir
+    (SCALP_LOOKBACK_CANDLES) untuk trigger.
+
+    PENTING -- parameter displacement body-mult, rasio wick/body pin bar,
+    toleransi key level, dan rentang SL 8-40 pips di engine.py masih nilai
+    desain awal, BELUM divalidasi lewat backtest per sub-metode. Endpoint ini
+    dipakai untuk MENGUMPULKAN DATA (forward-test akun demo + backtest data
+    historis secara paralel), bukan sinyal siap-eksekusi dengan uang riil.
+
+    CONCURRENCY CAP (2026-09-26): eksekusi sistem ini MANUAL (user baca
+    sinyal, buka posisi sendiri di MT5) -- server ini TIDAK PERNAH tahu
+    posisi mana yang masih terbuka di broker. Maka cap posisi searah
+    (SCALP_MAX_CONCURRENT_SAME_DIRECTION di engine.py) hanya bisa ditegakkan
+    kalau open_long/open_short di atas dilaporkan JUJUR oleh caller di setiap
+    panggilan -- ini BUKAN pengaman otomatis, ini pengaman yang bergantung
+    pada laporan manual. Kalau parameter ini tidak diisi (default 0), cap
+    efeknya tidak aktif sama sekali.
+    """
+    if not symbol or not interval:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Parameter 'symbol' dan 'interval' wajib diisi."},
+        )
+
+    try:
+        display, bsym, is_alias = resolve_symbol(symbol)
+        bint, tf_label = parse_timeframe(interval)
+
+        if not is_alias:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"/analyze-scalp khusus XAUUSD/XAU/GOLD. Simbol '{symbol}' "
+                             f"tidak didukung di sini -- pakai /analyze untuk crypto.",
+                },
+            )
+
+        asset_class = "xau"
+
+        # df Binance (PAXGUSDT) tetap diambil sbg fallback_df utk get_structure_df
+        # -- SAMA seperti jalur /analyze, supaya sub-metode scalp jalan di atas
+        # struktur XAUUSD asli (TwelveData) kalau tersedia, atau fallback yang
+        # sama persis dengan mode swing kalau tidak (bukan sumber data lain lagi).
+        df = fetch_klines(bsym, bint, limit=300)
+        df_structure, structure_source = get_structure_df(asset_class, tf_label, df)
+
+        live_price = fetch_live_price(bsym)
+        spot_price, spot_label = fetch_spot_crosscheck(bsym)
+
+        open_positions = {"LONG": open_long, "SHORT": open_short}
+        result = detect_scalp_cascade(df_structure, lookback_candles=SCALP_LOOKBACK_CANDLES,
+                                       open_positions=open_positions)
+        setup_available = result.get("sub_method") is not None
+
+        last_row = df_structure.iloc[-1]
+        last_structure_time = (
+            last_row["open_time"].isoformat() if "open_time" in df_structure.columns else None
+        )
+
+        return {
+            "symbol": display,
+            "interval": tf_label,
+            "asset_class": asset_class,
+            "mode": "scalp_cascade",
+            "structure_source": structure_source,
+            "last_structure_candle_time": last_structure_time,
+            "last_structure_close": round(float(last_row["close"]), 4),
+            "price_live": live_price,
+            "price_is_live": live_price is not None,
+            # spot_price XAUUSD asli (gold-api) sbg cross-check terhadap entry
+            # yg dihitung dari df_structure -- sama filosofinya dgn /analyze.
+            "spot_price": spot_price,
+            "spot_label": spot_label,
+            "setup_available": setup_available,
+            **result,
+            "guard_sl_pips_range": [SCALP_SL_MIN_PIPS, SCALP_SL_MAX_PIPS],
+            "pip_size_assumed": SCALP_PIP_SIZE,
+            "lookback_candles": SCALP_LOOKBACK_CANDLES,
+            "concurrency": {
+                "open_long_reported": open_long,
+                "open_short_reported": open_short,
+                "max_same_direction": SCALP_MAX_CONCURRENT_SAME_DIRECTION,
+                "blocked_by_cap": result.get("blocked_by_concurrency_cap", False),
+            },
+            "calibration_status": "UNCALIBRATED -- parameter desain awal, belum divalidasi backtest "
+                                   "per sub-metode. Gunakan hasil endpoint ini utk mengumpulkan data "
+                                   "forward-test (demo) + backtest historis, bukan eksekusi live.",
+            "instruction_for_assistant": (
+                "SEBELUM memanggil endpoint ini, TANYAKAN dulu ke user berapa posisi LONG dan SHORT "
+                "dari sistem ini yang MASIH TERBUKA sekarang di MT5, dan kirim sebagai open_long/"
+                "open_short -- server tidak punya cara lain untuk tahu ini (eksekusi manual, tidak "
+                "ada koneksi broker). Kalau setup_available=false DAN concurrency.blocked_by_cap=true, "
+                "sampaikan ke user bahwa sinyal valid ada tapi ditahan karena cap posisi searah sudah "
+                "penuh -- JANGAN sarankan buka posisi baru arah itu. Kalau setup_available=false karena "
+                "alasan lain, sampaikan 'reason' apa adanya, JANGAN membuat atau menebak entry/SL/TP "
+                "sendiri. Kalau setup_available=true, tetap tampilkan calibration_status ke user -- ini "
+                "skeleton yang belum dikalibrasi, bukan sinyal final."
+            ),
+        }
+
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": f"Scalp cascade gagal: {e}"})
 
 
 if __name__ == "__main__":
